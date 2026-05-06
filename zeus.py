@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              ZEUS — AI Legal OSINT Aggregator v1.0               ║
+║              ZEUS — AI Legal OSINT Aggregator v1.1               ║
 ║         Bare-metal Kali NetHunter  ·  Operator: The Priest       ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
@@ -12,12 +12,23 @@
 ║   from public sources only — read-only OSINT, no auth bypass,    ║
 ║   no stolen credentials, no system mutation.                     ║
 ║                                                                  ║
-║   v1.0 — INITIAL OSINT BUILD (forked from Ares skeleton)         ║
+║   v1.1 — bug-fix pass on first real run                          ║
+║   • Stripped IOC fanout (was leaking Ares defensive log sweeps). ║
+║   • Strategist now strictly delegates via [HANDOFF];             ║
+║     specialists actually run their tools.                        ║
+║   • Email/domain regex now require a real TLD —                  ║
+║     no more journal-filename / .log false positives.             ║
+║   • Report cleanup pass rewritten as Zeus OSINT prose            ║
+║     (subject overview, surfaced identifiers, coverage gaps),     ║
+║     not Ares ATT&CK / containment / EDR.                         ║
+║   • Person-intake trimmed to things you'd actually know          ║
+║     (name, aliases, emails, phones, handles, URLs, region,       ║
+║     images, notes).  No more PGP fingerprints / SSH key          ║
+║     fingerprint / year-of-birth / employer / industry.           ║
 ║                                                                  ║
 ║   FRONT-LOADED INTAKE → AUTONOMOUS RUN → TERMINAL REPORT         ║
-║   • At session start: lane gate + subject-type + extensive       ║
-║     identifier intake (name, emails, phones, handles, URLs,      ║
-║     PGP/SSH fingerprints, image paths, etc).                     ║
+║   • At session start: lane gate + subject-type + lean            ║
+║     identifier intake (only what you'd actually know).           ║
 ║   • Then: AUTO_MODE on — no y/n/q gates, no per-step prompts.    ║
 ║     Zeus runs the agent loop until done, capped at 50 turns or   ║
 ║     15 minutes wall-clock by default.                            ║
@@ -90,7 +101,7 @@ try:
     HAS_NETWORKX = True
 except ImportError:
     HAS_NETWORKX = False
-    print("WARN: networkx not installed — threat graph disabled. "
+    print("WARN: networkx not installed — pivot graph disabled. "
           "Run: pip install networkx --break-system-packages")
 
 try:
@@ -103,7 +114,7 @@ except ImportError:
 # VERSION & PROVIDER CHAIN  (Groq only, biggest→smallest)
 # ═════════════════════════════════════════════════════════════════════
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 # Strict size descending. Compound models last because they have their
 # own internal multi-step behaviour that fights our DTT control flow.
@@ -733,12 +744,30 @@ def all_kali_tools_flat() -> List[str]:
 
 
 def kali_tool_summary_for_prompt() -> str:
-    """Compressed list for system prompts so AI knows what's available."""
+    """Compressed list for system prompts so AI knows what's available.
+
+    Zeus filters KALI_TOOLS to categories that overlap with OSINT —
+    DNS lookups, certificate inspection, binary/EXIF tools, and
+    miscellaneous utilities.  Defensive categories (ids_ips,
+    memory_forensics, disk_forensics, malware_triage, etc.) are
+    suppressed: they have nothing to do with public-source OSINT
+    and just bias the LLM toward the wrong tools.  The actual
+    primary OSINT tools (sherlock / holehe / maigret / phoneinfoga
+    / whois / subfinder / amass / exiftool) come from the structured
+    tool registry below this block, not from KALI_TOOLS."""
+    OSINT_RELEVANT_CATS = {
+        "dns_defense",       # dig, host, nslookup — useful for registrar
+        "ssl_tls",           # cert investigation
+        "binary_inspection", # file, strings, exiftool — useful for cartographer
+        "misc_useful",       # general utilities
+    }
     parts = []
     for cat, tools in KALI_TOOLS.items():
+        if cat not in OSINT_RELEVANT_CATS:
+            continue
         # Trim to the most important per category to save tokens
         parts.append(f"  {cat}: {', '.join(tools[:10])}")
-    return "KALI ARSENAL AVAILABLE:\n" + "\n".join(parts)
+    return "KALI ARSENAL (OSINT-relevant subset):\n" + "\n".join(parts)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -834,6 +863,62 @@ DOMAIN_NOISE = {
     'localhost', 'example.com', 'google.com', 'cloudflare.com',
     'localdomain', 'arpa', 'in-addr.arpa',
 }
+
+# Valid TLD whitelist — used to reject false-positive domain/email
+# matches like `boot.log`, `system@HASH.journal`, `lynis-report.dat`.
+# A finding is rejected if the segment after the last dot is NOT in
+# this set.  Includes all 2-letter country codes and the gTLDs Zeus
+# is realistically going to encounter in OSINT output.
+VALID_TLDS = {
+    # Core gTLDs
+    'com', 'org', 'net', 'info', 'biz', 'edu', 'gov', 'mil', 'int',
+    'name', 'pro', 'museum', 'aero', 'coop', 'jobs', 'mobi', 'travel',
+    'asia', 'cat', 'post', 'tel', 'xxx',
+    # Tech / common new gTLDs
+    'io', 'dev', 'app', 'ai', 'me', 'co', 'tv', 'fm', 'ly', 'gg', 'sh',
+    'im', 'gl', 'st', 'vc', 'ws', 'cc', 'bz', 'la', 'mu', 'mn',
+    'tech', 'online', 'site', 'store', 'shop', 'blog', 'cloud', 'host',
+    'web', 'page', 'link', 'click', 'fyi', 'world', 'life', 'club',
+    'today', 'news', 'email', 'team', 'works', 'space', 'live', 'press',
+    'design', 'studio', 'media', 'pub', 'community', 'social',
+    'xyz', 'top', 'art', 'tools', 'help', 'wtf', 'gay', 'lol',
+    'codes', 'agency', 'company', 'business', 'services', 'systems',
+    'network', 'group', 'global', 'tools', 'guru', 'engineer',
+    'digital', 'video', 'photo', 'photography', 'gallery', 'review',
+    'host', 'website', 'support', 'expert', 'directory', 'computer',
+    'rocks', 'ninja', 'guru', 'cool', 'one', 'zero', 'plus',
+    # All 2-letter country code TLDs
+    'ac','ad','ae','af','ag','ai','al','am','ao','aq','ar','as','at',
+    'au','aw','ax','az','ba','bb','bd','be','bf','bg','bh','bi','bj',
+    'bm','bn','bo','br','bs','bt','bw','by','bz','ca','cd','cf','cg',
+    'ch','ci','ck','cl','cm','cn','co','cr','cu','cv','cw','cx','cy',
+    'cz','de','dj','dk','dm','do','dz','ec','ee','eg','er','es','et',
+    'eu','fi','fj','fk','fm','fo','fr','ga','gb','gd','ge','gf','gg',
+    'gh','gi','gl','gm','gn','gp','gq','gr','gs','gt','gu','gw','gy',
+    'hk','hn','hr','ht','hu','id','ie','il','im','in','io','iq','ir',
+    'is','it','je','jm','jo','jp','ke','kg','kh','ki','km','kn','kp',
+    'kr','kw','ky','kz','la','lb','lc','li','lk','lr','ls','lt','lu',
+    'lv','ly','ma','mc','md','me','mg','mh','mk','ml','mm','mn','mo',
+    'mp','mq','mr','ms','mt','mu','mv','mw','mx','my','mz','na','nc',
+    'ne','nf','ng','ni','nl','no','np','nr','nu','nz','om','pa','pe',
+    'pf','pg','ph','pk','pl','pm','pn','pr','ps','pt','pw','py','qa',
+    're','ro','rs','ru','rw','sa','sb','sc','sd','se','sg','sh','si',
+    'sk','sl','sm','sn','so','sr','ss','st','sv','sx','sy','sz','tc',
+    'td','tf','tg','th','tj','tk','tl','tm','tn','to','tr','tt','tv',
+    'tw','tz','ua','ug','uk','us','uy','uz','va','vc','ve','vg','vi',
+    'vn','vu','wf','ws','ye','yt','za','zm','zw',
+}
+
+def _has_valid_tld(value: str) -> bool:
+    """Return True iff the segment after the last '.' is a recognised
+    TLD.  Used to reject filename-shaped false positives like
+    `boot.log`, `lynis-report.dat`, `system.journal`."""
+    if "." not in value:
+        return False
+    tld = value.rsplit(".", 1)[-1].lower()
+    if not tld or len(tld) > 12:
+        return False
+    return tld in VALID_TLDS
 
 
 # Sensitive paths to flag as "exposed_path" findings if found in output
@@ -1774,22 +1859,41 @@ AGENT_SPECS = {
         "icon": "♛",
         "color": "33",  # gold
         "persona": (
-            "You are Zeus' Strategist agent.  Your job is to read the "
-            "OSINT Task Tree (OTT) and decide which child node to "
-            "investigate next, OR add a new child node when a finding "
-            "reveals a new pivot path.  You do NOT write commands.  "
-            "You output a routing decision."
+            "You are Zeus' Strategist agent.  You are the ROUTER, not "
+            "an executor.  Your only job is to read the OSINT Task "
+            "Tree (OTT) and pick the right specialist to run next.  "
+            "You NEVER call tools, you NEVER write shell commands, "
+            "you NEVER do OSINT yourself.  You delegate.  Every turn."
         ),
         "extra_rules": (
-            "OUTPUT FORMAT:\n"
-            "[THOUGHT]<one paragraph reasoning over OTT state>[/THOUGHT]\n"
-            "[NEXT_NODE]<node id from OTT, e.g. 1.2.3>[/NEXT_NODE]\n"
-            "[AGENT]<one of: intake, socialite, postman, caller, "
+            "STRICT OUTPUT FORMAT — exactly these tags, nothing else:\n"
+            "[THOUGHT]<one short paragraph: which specialist fits the "
+            "next OTT node, and why>[/THOUGHT]\n"
+            "[HANDOFF]<one of: intake, socialite, postman, caller, "
             "registrar, cartographer, archivist, dorker, ledger, "
-            "reporter>[/AGENT]\n"
+            "reporter>[/HANDOFF]\n"
             "[CONF]<green|yellow|red>[/CONF]\n"
-            "Use WORKFLOW_COMPLETE in [NEXT_NODE] when the root goal "
-            "is met or all branches are exhausted."
+            "\n"
+            "FORBIDDEN: [CMD], [TOOL], [ARGS] — never use these.  "
+            "If you write a shell command, it will be discarded and "
+            "you will be re-prompted.\n"
+            "\n"
+            "ROUTING GUIDE:\n"
+            "  handles / usernames                → socialite\n"
+            "  email addresses                    → postman\n"
+            "  phone numbers                      → caller\n"
+            "  domains / subdomains / DNS         → registrar\n"
+            "  image files (EXIF / GPS)           → cartographer\n"
+            "  wayback / archive recovery         → archivist\n"
+            "  Google / GitHub dorks              → dorker\n"
+            "  BTC / ETH / SOL addresses          → ledger\n"
+            "  consolidate findings into report   → reporter\n"
+            "  validate intake / lane policy      → intake\n"
+            "\n"
+            "TERMINATION: when every identifier branch has been "
+            "exhausted by its specialist (status=done or dead_end), "
+            "emit [CMD]WORKFLOW_COMPLETE[/CMD] alone — that is the "
+            "ONLY time you may write [CMD]."
         ),
     },
 
@@ -2482,6 +2586,28 @@ def extract_findings_from_stdout(output: str,
                         continue
                     if "." not in val:
                         continue
+                    # ZEUS: reject filename-shaped false positives
+                    # (boot.log, system.journal, lynis-report.dat).
+                    # Domain must end in a recognised TLD.
+                    if not _has_valid_tld(val):
+                        continue
+                    # Reject if any non-final segment looks like a hex
+                    # blob ≥ 16 chars (journal-file pattern).
+                    parts = val.split(".")
+                    if any(len(p) >= 16 and re.fullmatch(r'[a-f0-9]+', p)
+                           for p in parts[:-1]):
+                        continue
+
+                if ftype == "email":
+                    # Email must end in a recognised TLD too —
+                    # otherwise `system@HASH.journal` slips through.
+                    domain_part = val.split("@", 1)[-1] if "@" in val else ""
+                    if not _has_valid_tld(domain_part):
+                        continue
+                    # Reject if local-part or domain-part contains a
+                    # hex blob ≥ 16 chars (systemd journal pattern).
+                    if re.search(r'[a-f0-9]{16,}', val):
+                        continue
 
                 if ftype == "account":
                     # Drop generic placeholders that show up in prose / docs
@@ -2558,27 +2684,10 @@ def auto_cve_lookup(output: str) -> str:
     return "".join(results)
 
 
-def analyze_and_suggest_exploit(cve: str, target: str, lhost: str) -> str:
-    """Defensive variant of Athena's exploit-suggestion helper.  Instead
-    of proposing an attack, it surfaces detection rules and patch
-    guidance for the CVE.  Signature kept for compatibility with the
-    session loop that calls this when a CVE finding lands."""
-    if not cve:
-        return ""
-    cve = cve.upper().strip()
-    out  = f"\n\033[34m{'='*60}\033[0m\n"
-    out += f"\033[34m🛡  DEFENSIVE TRIAGE: {cve}\033[0m\n"
-    out += f"\033[34m{'='*60}\033[0m\n"
-    out += "\n\033[33m[DETECT]\033[0m  Look for IOCs / sigma rule matches:\n"
-    out += f"  curl -s 'https://otx.alienvault.com/api/v1/indicators/cve/{cve}/general' | jq\n"
-    out += f"  sigma-cli rule search '{cve}'\n"
-    out += "\n\033[33m[PATCH]\033[0m  Check whether a fixed version is available:\n"
-    out += "  apt list --upgradable 2>/dev/null | grep -i security\n"
-    out += "  debsums -c | head\n"
-    out += "\n\033[33m[MITIGATE]\033[0m  If patch unavailable, look for compensating\n"
-    out += f"  controls — disable feature, restrict via firewall, audit access.\n"
-    out += f"\n\033[34m{'='*60}\033[0m\n"
-    return out
+# (Removed in v1.1: analyze_and_suggest_exploit — Ares' defensive CVE
+# triage helper.  Zeus is OSINT-only, doesn't enumerate CVEs from
+# authenticated sources, so this never fired on real Zeus runs.  Call
+# site in run_command was also removed.  See zeus5 commit history.)
 
 
 def compress_output_for_history(output: str,
@@ -2679,7 +2788,7 @@ def status_bar(target: str, agent: str, model: str,
            f"\033[90m│\033[0m \033[33m{agent:<8}\033[0m "
            f"\033[90m│\033[0m \033[36m{model[:14]:<14}\033[0m "
            f"\033[90m│\033[0m \033[32m✓{verified}\033[0m\033[90m/\033[33m?{unverified}\033[0m "
-           f"\033[90m│\033[0m \033[31mATT&CK ×{techniques}\033[0m "
+           f"\033[90m│\033[0m \033[31mOSINT ×{techniques}\033[0m "
            f"\033[90m│\033[0m {scope_pill}")
     visible = re.sub(r'\033\[[\d;]*m', '', bar)
     pad = max(0, width - len(visible))
@@ -2849,7 +2958,7 @@ def turn_box(turn_no: int, target: str, agent_role: str, model: str,
         f"target \033[36m{target_short}\033[0m",
         f"node \033[97m{node_id or '—'}\033[0m",
         f"\033[32m✓{verified}\033[0m\033[90m/\033[33m?{unverified}\033[0m",
-        f"\033[31mATT&CK ×{techniques}\033[0m",
+        f"\033[31mOSINT ×{techniques}\033[0m",
         f"\033[90m{model}\033[0m",
     ]
     body = ["  " + "  \033[90m·\033[0m  ".join(metas),
@@ -2983,7 +3092,7 @@ def boot_sequence_lines() -> List[str]:
         f"\033[90m   [boot]\033[0m \033[32m✓\033[0m  registering {len(AGENT_SPECS)} specialist agents",
         f"\033[90m   [boot]\033[0m \033[32m✓\033[0m  registering {len(TOOL_DISPATCH)} OSINT tools",
         f"\033[90m   [boot]\033[0m \033[32m✓\033[0m  loading {len(MITRE_TECHNIQUES)} OSINT category mappings",
-        f"\033[90m   [boot]\033[0m {graph_glyph}  threat graph: {graph_msg}",
+        f"\033[90m   [boot]\033[0m {graph_glyph}  pivot graph: {graph_msg}",
         f"\033[90m   [boot]\033[0m  ·  GitHub auth: {gh_msg}",
         "\033[90m   [boot]\033[0m \033[32m✓\033[0m  smart-context manager online",
         f"\033[90m   [boot]\033[0m \033[32m✓\033[0m  AUTONOMOUS MODE armed (max {MAX_AUTO_TURNS} turns / {MAX_WALL_CLOCK_SECONDS//60} min wall-clock)",
@@ -4095,29 +4204,25 @@ class AttackGraph:
         return targets
 
     def pivot_suggestions(self) -> List[str]:
-        """Surface attack-graph queries the LLM should consider."""
+        """Return OSINT-flavoured pivot hints based on graph state.
+
+        The Athena/Ares incarnations of this function suggested
+        offensive pivots (untested creds, unexploited CVEs, uncracked
+        hashes).  Zeus is OSINT-only and never gathers those node
+        kinds in normal operation, so we just surface domain/host
+        pivots for OSINT specialists to act on."""
         if not self._has():
             return []
-        suggestions = []
-        # Creds that have never been tested
-        for nid, attrs in self.g.nodes(data=True):
-            if attrs.get("kind") == self.NODE_CRED and not attrs.get("verified"):
-                tested = sum(1 for _, _, e in self.g.out_edges(nid, data=True)
-                             if e.get("kind") == self.EDGE_WORKS)
-                if tested == 0:
-                    suggestions.append(
-                        f"Untested credential {attrs.get('label','?')} — "
-                        f"try across {len(self.auth_services())} auth services")
-        # Vulns without exploit attempt
-        vulns = [a.get("label") for n, a in self.g.nodes(data=True)
-                 if a.get("kind") == self.NODE_VULN]
-        if vulns:
-            suggestions.append(f"Known CVEs not yet exploited: {', '.join(vulns[:5])}")
-        # Hashes without crack attempt
-        hashes = [a.get("label") for n, a in self.g.nodes(data=True)
-                  if a.get("kind") == self.NODE_HASH]
-        if hashes:
-            suggestions.append(f"{len(hashes)} hash(es) in queue — confirm cracking attempted")
+        suggestions: List[str] = []
+        # Domains that haven't been wayback-checked
+        domains = [a.get("label") for n, a in self.g.nodes(data=True)
+                   if a.get("kind") == self.NODE_DOMAIN]
+        if domains:
+            head = domains[:3]
+            suggestions.append(
+                f"{len(domains)} domain(s) in graph — consider wayback / "
+                f"subfinder pivot ({', '.join(head)})"
+            )
         return suggestions
 
     def summary(self) -> str:
@@ -4566,31 +4671,32 @@ def build_system_prompt(agent_role: str,
     else:
         ptt_block = "PTT: (empty — set a target first)"
 
-    # Skip directives derived from findings
+    # Skip directives derived from findings — OSINT-flavoured, not offensive.
+    # Suggests next OSINT pivots based on what's already been surfaced.
     skip = []
     fdict = ptt.findings_by_type_dict()
-    if fdict.get("port"):
-        skip.append("ports already known — skip discovery")
-    if fdict.get("ip") and len(fdict["ip"]) > 1:
-        skip.append("hosts already known — skip ping sweep")
-    if fdict.get("svc"):
-        skip.append("services fingerprinted — skip banner grab")
-    if fdict.get("user"):
-        skip.append("USE known users for spray")
-    if fdict.get("cred"):
-        skip.append("TEST creds across all services NOW")
-    if fdict.get("hash") or fdict.get("hash_ntlm") or fdict.get("krb_hash"):
-        skip.append("QUEUE hashes for cracking")
-    if fdict.get("cve"):
-        skip.append("EXPLOIT known CVEs first")
+    if fdict.get("email"):
+        skip.append("emails surfaced — pivot to holehe / gravatar / MX")
+    if fdict.get("handle") or fdict.get("account"):
+        skip.append("handles surfaced — pivot to sherlock / maigret across platforms")
+    if fdict.get("domain"):
+        skip.append("domains surfaced — pivot to whois / subfinder / crt.sh")
+    if fdict.get("url"):
+        skip.append("URLs surfaced — pivot to wayback / gau / urlscan")
+    if fdict.get("phone"):
+        skip.append("phones surfaced — pivot to phoneinfoga")
+    if fdict.get("crypto_addr"):
+        skip.append("crypto addresses surfaced — pivot to public chain queries")
+    if fdict.get("image") or fdict.get("exif"):
+        skip.append("images surfaced — pivot to exiftool")
     skip_block = ""
     if skip:
-        skip_block = "PIVOT DIRECTIVES: " + " | ".join(skip)
+        skip_block = "OSINT PIVOT HINTS: " + " | ".join(skip)
 
     # Attack graph block
     graph_block = ""
     if expand_graph and graph is not None:
-        graph_block = "ATTACK GRAPH STATE:\n" + graph.to_compact_text(max_chars=1200)
+        graph_block = "PIVOT GRAPH STATE:\n" + graph.to_compact_text(max_chars=1200)
     elif graph is not None:
         graph_block = f"GRAPH: {graph.summary()}  (request [NEED]graph[/NEED] for paths)"
 
@@ -4702,6 +4808,12 @@ def parse_specialist_response(text: str) -> Dict[str, Any]:
     if h:
         out["handoff"] = h.group(1).strip().lower()
 
+    # Strategist may emit [AGENT]xxx[/AGENT] — treat as handoff
+    if not out["handoff"]:
+        a = re.search(r'\[AGENT\]\s*(\w+)\s*\[/?AGENT\]', text, re.IGNORECASE)
+        if a:
+            out["handoff"] = a.group(1).strip().lower()
+
     # v7.1 — multiple [NEED] tags allowed in one response
     needs = re.findall(r'\[NEED\]\s*([^\[\]]+?)\s*\[/?NEED\]', text, re.IGNORECASE)
     if needs:
@@ -4737,7 +4849,7 @@ class ZeusSession:
         # PTT replaces the flat findings dict.
         self.ptt = PTT(goal="Mission undefined")
 
-        # v7.1 — scope, threat graph, context manager
+        # v7.1 — scope, pivot graph, context manager
         self.scope = ScopeConfig.load()
         self.graph = AttackGraph()
         self.context_mgr = ContextManager()
@@ -5039,25 +5151,18 @@ class ZeusSession:
                 return ""
 
         if subject_type == "person":
-            ident["real_name"]    = _single("Real name (or alias):")
-            ident["aliases"]      = _multiline("Aliases / nicknames:")
-            ident["year_of_birth"] = _single("Year of birth (year only, blank=skip):")
-            ident["emails"]       = _multiline("Email addresses:")
-            ident["phones"]       = _multiline("Phone numbers (E.164 format preferred):")
-            ident["handles"]      = _multiline(
-                "Usernames in 'platform:handle' format (e.g. github:thepriest):"
+            ident["real_name"] = _single("Name (real name or alias):")
+            ident["aliases"]   = _multiline("Other names / nicknames they use:")
+            ident["emails"]    = _multiline("Email addresses:")
+            ident["phones"]    = _multiline("Phone numbers:")
+            ident["handles"]   = _multiline(
+                "Usernames (one per line — bare handles like 'thepriest' or "
+                "'platform:handle' format if you know the platform):"
             )
-            ident["urls"]         = _multiline("Profile URLs:")
-            ident["region"]       = _single("City/state/country (NOT street):")
-            ident["employer"]     = _single("Employer / institution:")
-            ident["industry"]     = _single("Industry / profession:")
-            ident["languages"]    = _single("Languages:")
-            ident["images"]       = _multiline("Image file paths (for EXIF):")
-            ident["pgp_fpr"]      = _single("PGP key fingerprint:")
-            ident["ssh_or_gh"]    = _single(
-                "SSH key fingerprint OR GitHub username (for /USER.keys cross-check):"
-            )
-            ident["notes"]        = _single("Free-text notes:")
+            ident["urls"]      = _multiline("Profile URLs / websites:")
+            ident["region"]    = _single("Country or city (NEVER street):")
+            ident["images"]    = _multiline("Image file paths (for EXIF):")
+            ident["notes"]     = _single("Anything else worth noting:")
 
         elif subject_type == "company":
             ident["legal_name"]   = _single("Legal name:")
@@ -5193,7 +5298,7 @@ class ZeusSession:
     # ── Command execution (with full y/n gate) ────────────────────
 
     def _sync_graph_from_recent_findings(self, last_n: int):
-        """Push the most recent N findings into the threat graph."""
+        """Push the most recent N findings into the pivot graph."""
         if not self.graph._has() or last_n <= 0:
             return
         for f in self.ptt.findings[-last_n:]:
@@ -5234,26 +5339,18 @@ class ZeusSession:
                 continue
 
     def _flush_cred_fanout(self):
-        """When IOCs land (suspicious hash, IP, domain), queue follow-up
-        sweeps so other agents can hunt for the same indicator across
-        every relevant log/host.  Defensive equivalent of Athena's
-        credential fanout — same queue mechanism, different intent.
-        Called between agent turns; adds DTT subnodes the LLM can pick up."""
-        if not self.ioc_fanout_queue:
-            return
-        parent = self.ptt.find_in_progress() or self.ptt.nodes[self.ptt.root_id]
-        for ioc_value, ioc_type in self.ioc_fanout_queue[:5]:
-            # Build an "IOC sweep" subnode so the threat hunter can
-            # propagate this indicator across logs / hosts / pcaps.
-            short = (ioc_value[:32] + "…") if len(ioc_value) > 32 else ioc_value
-            fanout_id = self.ptt.add_node(
-                parent.nid,
-                f"IOC sweep: {ioc_type} '{short}' across logs/pcap/hosts",
-                phase="hunt",
-                status="todo",
-            )
-            print(f"\033[33m   ↳ IOC fanout: queued sweep for "
-                  f"{ioc_type} '{short}' (node {fanout_id})\033[0m")
+        """No-op for Zeus.
+
+        Inherited from Ares (defensive) where IOCs got fanned out into
+        local-host log/pcap sweeps.  Zeus is an OSINT aggregator —
+        new identifiers should be pivoted OUT to public sources by the
+        appropriate specialist, not swept INWARD across /var/log.
+
+        The fanout queue is still populated by add_finding() but Zeus
+        ignores it.  Specialists pick up new identifiers via the OTT
+        directly when the strategist routes to them."""
+        # Drain the queue so memory doesn't grow unbounded, but don't
+        # spawn any sweep nodes.
         self.ioc_fanout_queue.clear()
 
     # Zeus runs OSINT tools — none need root.  All sudo machinery is
@@ -5508,15 +5605,11 @@ class ZeusSession:
                 # Add to context, but DON'T parse this as findings
                 # (those CVEs already came from real output)
 
-        # Auto-exploit suggestion when CVE found
-        cve_matches = re.findall(r'CVE-\d{4}-\d+', raw_output, re.IGNORECASE)
-        if cve_matches:
-            target = (self.target_info.get("ip") or
-                      self.target_info.get("domain") or "TARGET")
-            for cve in cve_matches[:2]:
-                expl = analyze_and_suggest_exploit(cve, target, self.lhost)
-                if expl:
-                    print(expl)
+        # ZEUS: removed Ares' auto-exploit / defensive-triage suggestion
+        # path here.  CVE strings surfacing in OSINT output (e.g. in a
+        # bug-bounty scope file or on a security blog) are leads, not
+        # triggers for sigma rule lookups or apt-upgrade suggestions.
+        # The reporter agent will surface them in the final report.
 
         self._log(f"[OUTPUT]\n{raw_output}")
 
@@ -5549,7 +5642,7 @@ class ZeusSession:
                 )
             print()
             print(findings_card(new_count, items))
-            # Feed new findings into threat graph
+            # Feed new findings into pivot graph
             self._sync_graph_from_recent_findings(new_count)
             # Defensive fanout: when an IOC (suspicious hash, alert,
             # YARA hit, suricata alert, persistence artifact, sus IP)
@@ -5633,7 +5726,7 @@ class ZeusSession:
                 f.notes = f"Verified by: {verify_cmd[:120]}"
                 print(f"\033[32m   ✓ VERIFIED — "
                       f"{finding_type}={finding_value} confirmed real\033[0m")
-                # v7.1 — sync to threat graph
+                # v7.1 — sync to pivot graph
                 if finding_type == "cred" and self.graph._has():
                     # Try to extract host:port from verify_cmd
                     host_match = re.search(
@@ -5651,45 +5744,59 @@ class ZeusSession:
 
     def _select_agent(self, node: Optional[PTTNode],
                       free_form: str = "") -> str:
-        """Deterministic dispatcher: DTT node phase → specialist role."""
+        """Deterministic dispatcher: OTT node phase → specialist role.
+
+        For Zeus this is mostly a passthrough — the strategist handles
+        routing by emitting [HANDOFF].  We only consult phase mappings
+        when there's no active handoff in progress.
+        """
+        # Honour an explicit handoff that was set on the previous turn.
+        forced = getattr(self, "_forced_next_agent", None)
+        if forced and forced in AGENT_SPECS:
+            self._forced_next_agent = None
+            return forced
+
+        # OTT phase mapping
         if node and node.phase in PHASE_TO_AGENT:
             return PHASE_TO_AGENT[node.phase]
 
-        # Fallback: keyword scan over free-form text
+        # Free-form keyword scan — Zeus OSINT specialists only
         lower = (free_form or "").lower()
-        if any(k in lower for k in ["log", "journal", "syslog", "auth.log",
-                                     "auditd", "ausearch", "aureport"]):
-            return "log_analyst"
-        if any(k in lower for k in ["pcap", "tcpdump", "tshark", "zeek",
-                                     "suricata", "snort", "ids", "ips",
-                                     "wireshark", "fast.log"]):
-            return "network_defender"
-        if any(k in lower for k in ["malware", "yara", "virus", "sample",
-                                     "trojan", "capa", "olevba", "pdfid"]):
-            return "malware_analyst"
-        if any(k in lower for k in ["memory", "volatility", "lime", "avml",
-                                     "disk image", "sleuthkit", "fls",
-                                     "mactime", "carve", "foremost"]):
-            return "forensics_analyst"
-        if any(k in lower for k in ["account", "user", "sudo", "passwd",
-                                     "shadow", "kerberos", "ldap",
-                                     "samba", "ssh key"]):
-            return "identity_defender"
-        if any(k in lower for k in ["harden", "lynis", "cis", "openscap",
-                                     "baseline", "sysctl", "compliance"]):
-            return "hardener"
-        if any(k in lower for k in ["incident", "compromise", "contain",
-                                     "quarantine", "kill", "block",
-                                     "eradicate", "respond"]):
-            return "ir_responder"
-        if any(k in lower for k in ["hunt", "persistence", "rootkit",
-                                     "backdoor", "anomaly", "sigma",
-                                     "chainsaw", "hayabusa"]):
-            return "threat_hunter"
+        if any(k in lower for k in ["sherlock", "maigret", "whatsmyname",
+                                     "username", "handle", "platform",
+                                     "github user", "reddit user",
+                                     "mastodon", "bluesky"]):
+            return "socialite"
+        if any(k in lower for k in ["holehe", "gravatar", "email triage",
+                                     "mx record", "spf", "dmarc",
+                                     "pgp keyserver"]):
+            return "postman"
+        if any(k in lower for k in ["phoneinfoga", "phone osint",
+                                     "carrier lookup", "line type"]):
+            return "caller"
+        if any(k in lower for k in ["whois", "subfinder", "amass",
+                                     "crt.sh", "subdomain", "domain footprint",
+                                     "asn", "dns record"]):
+            return "registrar"
+        if any(k in lower for k in ["exiftool", "exif", "image metadata",
+                                     "gps coord", "camera serial"]):
+            return "cartographer"
+        if any(k in lower for k in ["wayback", "archive.org", "gau",
+                                     "waybackurls", "snapshot",
+                                     "deleted content"]):
+            return "archivist"
+        if any(k in lower for k in ["google dork", "github dork",
+                                     "secret hunt", "leak hunt"]):
+            return "dorker"
+        if any(k in lower for k in ["btc address", "eth address",
+                                     "blockchain", "wallet", "crypto",
+                                     "ens reverse"]):
+            return "ledger"
         if any(k in lower for k in ["report", "summary", "writeup",
-                                     "executive"]):
+                                     "consolidate", "executive"]):
             return "reporter"
-        return "triage"
+        # Default: strategist routes
+        return "strategist"
 
     # ── Two-pass thinking turn ───────────────────────────────────
 
@@ -5816,12 +5923,49 @@ class ZeusSession:
             self.history = self.history[-(MAX_HISTORY_MESSAGES * 2):]
         self._log(f"[AI:{agent_role}]\n{response}")
 
+        # ZEUS GUARD: strategist MUST delegate, never execute.  If the
+        # strategist emitted [CMD] or [TOOL] alongside (or instead of)
+        # a handoff, drop them — UNLESS the [CMD] is WORKFLOW_COMPLETE,
+        # which is the strategist's only way to end the investigation.
+        # Without this guard the strategist runs OSINT commands itself
+        # and the specialists never get a turn.
+        self._pending_dispatch_error = None
+        if agent_role == "strategist":
+            cmd_is_workflow_done = (
+                parsed["cmd"]
+                and "WORKFLOW_COMPLETE" in parsed["cmd"].upper()
+                and not parsed["tool"]
+            )
+            if cmd_is_workflow_done:
+                # Pass through — investigation termination is allowed.
+                # Normalise to bare WORKFLOW_COMPLETE so downstream
+                # comparisons match.
+                parsed["cmd"] = "WORKFLOW_COMPLETE"
+                parsed["tool"] = None
+                parsed["args"] = None
+            elif parsed["cmd"] or parsed["tool"]:
+                # Strategist tried to run an actual command — strip it.
+                parsed["cmd"] = None
+                parsed["tool"] = None
+                parsed["args"] = None
+                # If there was no handoff either, queue a corrective
+                # message that forces the strategist to delegate next turn.
+                if not parsed["handoff"]:
+                    self._pending_dispatch_error = (
+                        "STRATEGIST RULE: you must NEVER emit [CMD] or "
+                        "[TOOL] (except [CMD]WORKFLOW_COMPLETE[/CMD] to "
+                        "end the investigation).  Your only output is "
+                        "[HANDOFF]<role>[/HANDOFF] where <role> is one "
+                        "of: intake, socialite, postman, caller, "
+                        "registrar, cartographer, archivist, dorker, "
+                        "ledger, reporter."
+                    )
+
         # v7.2 — TOOL dispatch: convert [TOOL]/[ARGS] → shell string.
         # Hard errors are stashed on self._pending_dispatch_error so the
         # agent loop can splice them into the next prompt — that way
         # the LLM actually learns about its bad kwargs instead of
         # looping the same args.
-        self._pending_dispatch_error = None
         dispatch_remap_note = ""
         if parsed["tool"]:
             shell, msg = dispatch_tool(parsed["tool"], parsed["args"] or "{}")
@@ -5839,6 +5983,10 @@ class ZeusSession:
                 )
                 if not parsed["cmd"]:
                     parsed["cmd"] = None  # no fallback — agent loop will retry
+
+        # If a handoff is requested, queue it for next turn's _select_agent
+        if parsed["handoff"] and parsed["handoff"] in AGENT_SPECS:
+            self._forced_next_agent = parsed["handoff"]
 
         # v7.2 — failure-aware confidence.  If we've failed N times
         # already on this node, force a yellow/red regardless of what
@@ -5921,13 +6069,15 @@ class ZeusSession:
             f"Verified findings: {' | '.join(verified_summary) or 'minimal'}.\n"
             "Output ONLY this format:\n"
             "[OPTIONS]\n"
-            "1. <approach 1 — fundamentally different angle, one line>\n"
-            "2. <approach 2 — different angle, one line>\n"
-            "3. <approach 3 — different angle, one line>\n"
+            "1. <approach 1 — fundamentally different OSINT angle, one line>\n"
+            "2. <approach 2 — different OSINT angle, one line>\n"
+            "3. <approach 3 — different OSINT angle, one line>\n"
             "[/OPTIONS]\n"
-            "Each option must take a totally different approach (e.g. log "
-            "review vs persistence hunt vs network capture vs hardening "
-            "audit vs forensic timeline)."
+            "Each option must take a totally different OSINT approach "
+            "(e.g. handle pivot to a new platform vs email registration "
+            "probe vs domain/subdomain enumeration vs wayback archive "
+            "recovery vs blockchain address lookup vs EXIF/image "
+            "metadata).  Stay within the declared lane and refuse list."
         )
 
         response = self._think_with_fallback([
@@ -6024,6 +6174,27 @@ class ZeusSession:
                 self._pending_dispatch_error = None
 
             if cmd is None:
+                # ZEUS: a handoff with no command is normal for the
+                # strategist (and for any specialist that wants to
+                # delegate).  Switch agent and continue without
+                # counting it as a failed turn.
+                if handoff and handoff in AGENT_SPECS:
+                    self._forced_next_agent = handoff
+                    self._no_cmd_retries = 0
+                    spec = AGENT_SPECS[handoff]
+                    print(f"\033[36m   ↪ routing to "
+                          f"\033[{spec['color']}m{spec['icon']} "
+                          f"{spec['name']}\033[0m")
+                    # Build a fresh prompt for the next agent
+                    prompt = (
+                        f"You are now active.  Read the OTT and the "
+                        f"intake identifiers, pick the right tool from "
+                        f"your specialty, and emit a single [TOOL] or "
+                        f"[CMD] block.  Stay within your lane "
+                        f"({self.target_info.get('lane', 'unknown')})."
+                    )
+                    continue
+
                 # v7.1 — instead of bailing, retry up to 2x with a
                 # corrective hint.  This recovers from tool-dispatch
                 # failures and from the LLM accidentally omitting [CMD].
@@ -6037,7 +6208,9 @@ class ZeusSession:
                         "[ARGS]…[/ARGS]) plus [THOUGHT][CONF].  If your "
                         "preferred tool isn't in the structured registry or "
                         "its dispatch failed, fall back to [CMD] with the "
-                        "raw shell command."
+                        "raw shell command.  If you cannot make further "
+                        "progress on this branch, emit "
+                        "[CMD]WORKFLOW_COMPLETE[/CMD] alone."
                     )
                     continue
                 else:
@@ -6387,8 +6560,8 @@ class ZeusSession:
     # ── Report generation (with cleanup pass) ───────────────────
 
     def _llm_cleanup_pass(self) -> str:
-        """Ask the AI to write a clean report from verified findings only.
-        This is called at report-generation time.  Returns a markdown body.
+        """Ask the AI to write a clean OSINT report from the findings.
+        Called at report-generation time.  Returns a markdown body.
         Falls through to a plain dump if the LLM is unavailable.
         """
         verified = self.ptt.get_verified()
@@ -6405,34 +6578,80 @@ class ZeusSession:
 
         u_summary = []
         for f in self.ptt.get_unverified():
-            u_summary.append(f"- {f.ftype}: {f.value} (UNVERIFIED, node {f.node_id})")
+            u_summary.append(f"- {f.ftype}: {f.value} (unverified, node {f.node_id})")
 
-        target = (self.target_info.get("ip") or
-                  self.target_info.get("domain") or "Unknown")
+        ti = self.target_info or {}
+        lane = ti.get("lane") or "(no lane)"
+        subj_type = ti.get("subject_type") or "(no subject type)"
+        ident = ti.get("identifiers") or {}
+        seed_label = (
+            ident.get("real_name") or ident.get("legal_name") or
+            ident.get("primary") or
+            (ident.get("addresses") or [None])[0] or
+            (ident.get("handles") or [None])[0] or
+            "(unnamed subject)"
+        )
+
+        # Inventory of intake identifiers (so the LLM knows what
+        # categories were declared up front — separates "what we knew"
+        # from "what we surfaced").
+        intake_lines: List[str] = []
+        for k, v in ident.items():
+            if not v:
+                continue
+            if isinstance(v, list):
+                for item in v:
+                    intake_lines.append(f"- {k}: {item}")
+            else:
+                intake_lines.append(f"- {k}: {v}")
 
         sys_prompt = (
-            "You are Zeus' Reporter agent.  You write professional "
-            "defensive engagement reports.  Be concise, factual.  Use "
-            "Markdown headers.  Map every finding to a MITRE ATT&CK "
-            "technique where applicable.  Never invent findings — only "
-            "use what is provided.  Drop unverified findings unless "
-            "they are clearly part of the timeline."
+            "You are Zeus' Reporter agent.  You write OSINT investigation "
+            "summaries from public-source data only.  Be concise and "
+            "factual.  Use Markdown.  Never invent findings — use only "
+            "what is provided in the prompt.  This is OSINT, not "
+            "incident response: do NOT use ATT&CK terminology, do NOT "
+            "write 'verdict: healthy/suspicious/compromised', do NOT "
+            "recommend EDR or hardening.  This report describes what "
+            "is publicly findable about a subject."
         )
 
         user_prompt = (
-            f"Host: {target}\n"
-            f"Mission: {self.target_info.get('notes') or '—'}\n\n"
-            f"VERIFIED FINDINGS:\n" + ("\n".join(v_summary) or "(none)") +
-            "\n\nUNVERIFIED FINDINGS (mention only if part of the timeline):\n" +
-            ("\n".join(u_summary) or "(none)") +
-            "\n\nWrite a report with sections:\n"
-            "## Executive Summary (verdict: healthy / suspicious / compromised)\n"
-            "## Confirmed Findings (grouped by ATT&CK technique)\n"
-            "## Timeline (chronological)\n"
-            "## Containment Actions Taken\n"
-            "## Remaining Risks\n"
-            "## Recommended Hardening\n"
-            "## Appendix: Tooling & Methodology"
+            f"Subject:       {seed_label}\n"
+            f"Lane:          {lane}\n"
+            f"Subject type:  {subj_type}\n\n"
+            f"INTAKE IDENTIFIERS (operator-declared):\n"
+            f"{chr(10).join(intake_lines) or '(none)'}\n\n"
+            f"VERIFIED FINDINGS (multi-source corroborated):\n"
+            f"{chr(10).join(v_summary) or '(none)'}\n\n"
+            f"UNVERIFIED FINDINGS (single-source, treat as leads):\n"
+            f"{chr(10).join(u_summary) or '(none)'}\n\n"
+            f"Write a concise OSINT report with these sections:\n"
+            f"## Subject Overview\n"
+            f"   Two or three sentences: who/what was investigated, "
+            f"under which lane, and why it matters in plain English.\n"
+            f"## Surfaced Identifiers\n"
+            f"   New identifiers Zeus discovered beyond what the "
+            f"operator provided (handles, emails, domains, profiles).  "
+            f"Group by category.  Skip if there are none.\n"
+            f"## Cross-Platform Presence\n"
+            f"   Where the subject appears across the public web "
+            f"(social platforms, GitHub, mastodon, etc.).  Skip if no "
+            f"such findings exist.\n"
+            f"## Infrastructure / Footprint\n"
+            f"   Domains, subdomains, DNS records, archive snapshots — "
+            f"applicable mainly for company/domain subjects.  Skip if "
+            f"no such findings exist.\n"
+            f"## Coverage Gaps\n"
+            f"   Branches Zeus could not exhaust (rate-limited, missing "
+            f"tools, lane-restricted).  Operator should investigate "
+            f"these manually.\n"
+            f"## Confidence\n"
+            f"   Brief breakdown — N findings high-confidence "
+            f"(corroborated), M medium (single source), K leads only.\n\n"
+            f"Do not invent ATT&CK techniques, MITRE IDs, threat "
+            f"actors, or compromise verdicts.  This is a footprint "
+            f"report, not an incident report."
         )
 
         response = self._think_with_fallback([
@@ -6571,11 +6790,11 @@ class ZeusSession:
         exercised, findings grouped by technique."""
         lines = ["## OSINT Category Coverage\n"]
 
-        # Techniques exercised (from commands run)
+        # Categories exercised (from commands run)
         if self.attack_techniques_used:
-            lines.append("### Techniques Exercised\n")
-            lines.append("| ID | Technique | Tactic | Times |")
-            lines.append("|----|-----------|--------|-------|")
+            lines.append("### Categories Exercised\n")
+            lines.append("| ID | Category | Bucket | Times |")
+            lines.append("|----|----------|--------|-------|")
             # Sort by tactic, then by count desc
             sorted_techs = sorted(
                 self.attack_techniques_used.items(),
@@ -6586,7 +6805,7 @@ class ZeusSession:
                              f"{info['tactic']} | {info['count']} |")
             lines.append("")
         else:
-            lines.append("_No ATT&CK techniques recorded._\n")
+            lines.append("_No OSINT categories recorded._\n")
 
         # Findings grouped by technique
         by_tech: Dict[str, List[Finding]] = {}
@@ -6595,7 +6814,7 @@ class ZeusSession:
                 by_tech.setdefault(fnd.attack_id, []).append(fnd)
 
         if by_tech:
-            lines.append("### Findings by Technique\n")
+            lines.append("### Findings by Category\n")
             for tid in sorted(by_tech.keys()):
                 fs = by_tech[tid]
                 first = fs[0]
@@ -6693,8 +6912,8 @@ class ZeusSession:
             print(f"   Scope is now {state}\n")
 
     def show_graph(self):
-        """v7.1 — display threat graph state."""
-        print(f"\n{header_box('  ATTACK GRAPH  ', color='36')}\n")
+        """v7.1 — display OSINT pivot graph state."""
+        print(f"\n{header_box('  PIVOT GRAPH  ', color='36')}\n")
         if not HAS_NETWORKX:
             print("   \033[33m   networkx not installed.  "
                   "pip install networkx --break-system-packages\033[0m\n")
@@ -6712,10 +6931,15 @@ class ZeusSession:
         print()
 
     def show_mitre(self):
-        """v7.1 — display ATT&CK techniques exercised this session."""
-        print(f"\n{header_box('  MITRE ATT&CK COVERAGE  ', color='31')}\n")
+        """v7.1 — display OSINT categories exercised this session.
+
+        Variable names still say 'attack' for backwards compat with the
+        Ares skeleton (MITRE_TECHNIQUES, attack_id, etc.) but the
+        contents are repurposed as OSINT category mappings — see the
+        comment on MITRE_TECHNIQUES."""
+        print(f"\n{header_box('  OSINT CATEGORY COVERAGE  ', color='31')}\n")
         if not self.attack_techniques_used:
-            print("   \033[90m   No ATT&CK techniques recorded yet.\033[0m\n")
+            print("   \033[90m   No OSINT categories recorded yet.\033[0m\n")
             return
         # Group by tactic
         by_tactic: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
@@ -6936,7 +7160,7 @@ def _build_banner() -> str:
         L(f"        {W}███████╗███████╗╚██████╔╝███████║{M}                          ") + f"{M}│{R}",
         L(f"        {W}╚══════╝╚══════╝ ╚═════╝ ╚══════╝{M}                          ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
-        L(f"   {B}{W}AI OSINT AGGREGATOR{R}{M}  ·  {B}{C}v1.0{R}{M}                          ") + f"{M}│{R}",
+        L(f"   {B}{W}AI OSINT AGGREGATOR{R}{M}  ·  {B}{C}v1.1{R}{M}                          ") + f"{M}│{R}",
         L(f"   {G}Bare-metal Kali NetHunter  ·  Operator: The Priest{M}          ") + f"{M}│{R}",
         L(f"   {G}third pillar · Athena finds · Ares defends · Zeus aggregates{M}") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
