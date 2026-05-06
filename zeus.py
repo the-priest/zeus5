@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              ZEUS — AI Legal OSINT Aggregator v1.1               ║
+║              ZEUS — AI Legal OSINT Aggregator v1.2               ║
 ║         Bare-metal Kali NetHunter  ·  Operator: The Priest       ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
@@ -12,7 +12,7 @@
 ║   from public sources only — read-only OSINT, no auth bypass,    ║
 ║   no stolen credentials, no system mutation.                     ║
 ║                                                                  ║
-║   v1.1 — bug-fix pass on first real run                          ║
+║   v1.2 — bug-fix pass on first real run                          ║
 ║   • Stripped IOC fanout (was leaking Ares defensive log sweeps). ║
 ║   • Strategist now strictly delegates via [HANDOFF];             ║
 ║     specialists actually run their tools.                        ║
@@ -114,7 +114,7 @@ except ImportError:
 # VERSION & PROVIDER CHAIN  (Groq only, biggest→smallest)
 # ═════════════════════════════════════════════════════════════════════
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 # Strict size descending. Compound models last because they have their
 # own internal multi-step behaviour that fights our DTT control flow.
@@ -2536,14 +2536,162 @@ def detect_sensitive_paths(output: str) -> List[str]:
 # style phantom credentials.
 # ─────────────────────────────────────────────────────────────────────
 
+def _preprocess_output_for_extraction(output: str, source_cmd: str) -> str:
+    """Tool-aware preprocessing of stdout BEFORE regex extraction.
+
+    Different OSINT tools have different noise: holehe prints its
+    author's donation footer at the bottom of every run, curl -I
+    returns CSP headers full of unrelated whitelisted domains, etc.
+    This function returns a cleaned version of the output that
+    contains only the SIGNAL portions, so the regex extractor doesn't
+    pull tool-author Twitter handles or CSP whitelist entries as if
+    they were findings about the subject.
+
+    Conservative: when in doubt, returns the output unchanged.
+    """
+    if not output:
+        return output
+    cmd_lower = source_cmd.lower()
+
+    # ── HOLEHE ────────────────────────────────────────────────────
+    # Holehe output has a credit footer that ALWAYS appears, even
+    # when the email is not registered anywhere:
+    #   ****************************
+    #      <email>
+    #   ****************************
+    #   [+] Email used, [-] Email not used, [x] Rate limit
+    #   N websites checked in T seconds
+    #   Twitter : @palenath          ← TOOL AUTHOR, not target
+    #   Github : https://github.com/megadose/holehe
+    #   For BTC Donations : 1FHDM49Qf...
+    #
+    # Real findings appear ABOVE the "websites checked" line as
+    # `[+] Service: https://...` lines.  We keep only those lines.
+    if "holehe" in cmd_lower:
+        kept = []
+        stop = False
+        for line in output.splitlines():
+            stripped = line.strip()
+            # Stop at the legend/footer line
+            if re.search(r'websites checked', stripped, re.IGNORECASE):
+                stop = True
+                continue
+            if stop:
+                continue
+            # Skip the legend line itself if it appears anywhere
+            if "Email used" in stripped and "Rate limit" in stripped:
+                continue
+            # Keep only [+] hit lines (real registrations)
+            if stripped.startswith("[+]"):
+                kept.append(stripped)
+        return "\n".join(kept)
+
+    # ── HTTP HEADER NOISE ─────────────────────────────────────────
+    # The content-security-policy header lists dozens of unrelated
+    # CDN/blob/copilot domains as a source-list.  Some other headers
+    # (permissions-policy, report-to, expect-ct, feature-policy)
+    # similarly contain long allowlists.  These appear in BOTH
+    # curl -I responses AND full curl responses (since servers may
+    # echo headers in body or HTTP/2 -I).  Strip them universally.
+    HEADER_BLOCKLIST = (
+        "content-security-policy",
+        "content-security-policy-report-only",
+        "feature-policy", "permissions-policy",
+        "x-content-security-policy",
+        "report-to", "expect-ct",
+        "nel",  # network error logging — also has URL list
+    )
+    body_lines = output.splitlines()
+    cleaned_body = []
+    skip_continuation = False
+    for line in body_lines:
+        low = line.lower().strip()
+        # New header line — decide skip/keep
+        if re.match(r'^[a-z][a-z0-9\-]*:\s', low):
+            header_name = low.split(":", 1)[0].strip()
+            if header_name in HEADER_BLOCKLIST:
+                skip_continuation = True
+                continue
+            else:
+                skip_continuation = False
+                cleaned_body.append(line)
+        elif skip_continuation:
+            # Continuation of a stripped header (folded headers)
+            continue
+        else:
+            cleaned_body.append(line)
+    output = "\n".join(cleaned_body)
+    cmd_lower = source_cmd.lower()  # refresh after potential mutation
+
+    # ── SHERLOCK ──────────────────────────────────────────────────
+    # Sherlock output is `[+] Service: URL` per registration plus
+    # progress bars and totals at the end.  Keep only [+] lines so
+    # the totals/timing lines don't pollute (they look like
+    # "98 results in 41.2 seconds" etc.).
+    if "sherlock" in cmd_lower:
+        kept = [l for l in output.splitlines() if l.strip().startswith("[+]")]
+        return "\n".join(kept)
+
+    # ── MAIGRET ───────────────────────────────────────────────────
+    # Maigret prints similar [+] lines plus its own credit footer
+    # ("created by soxoj" etc.).
+    if "maigret" in cmd_lower:
+        kept = []
+        for line in output.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[+]"):
+                kept.append(stripped)
+            elif stripped.startswith("[-]"):
+                continue  # not registered
+        return "\n".join(kept)
+
+    # Default: pass through unchanged
+    return output
+
+
+# Known tool-author handles, donation addresses, and project URLs that
+# should NEVER be added as findings about the target — these surface as
+# pollution from tool credit footers regardless of which tool is being
+# parsed.  Zeus drops any finding whose value matches one of these.
+TOOL_CREDIT_NOISE = {
+    # holehe (megadose)
+    "@palenath", "palenath", "megadose", "github.com/megadose/holehe",
+    "github.com/megadose", "1FHDM49QfZX6pJmhjLE5tB2K6CaTLMZpXZ",
+    # sherlock (sdushantha)
+    "sdushantha", "github.com/sherlock-project/sherlock",
+    "sherlock-project",
+    # maigret (soxoj)
+    "soxoj", "github.com/soxoj/maigret",
+    # phoneinfoga (sundowndev)
+    "sundowndev", "github.com/sundowndev/phoneinfoga",
+    # subfinder (projectdiscovery)
+    "projectdiscovery", "github.com/projectdiscovery",
+    # gau (lc)
+    "github.com/lc/gau",
+    # waybackurls (tomnomnom)
+    "tomnomnom", "github.com/tomnomnom",
+    # general
+    "w3.org",  # XHTML doctype URLs are not findings
+}
+
+
 def extract_findings_from_stdout(output: str,
                                  source_cmd: str,
                                  ptt: PTT,
                                  active_node_id: str) -> int:
     """Run regex patterns over RAW subprocess stdout only.
 
+    v1.2: tool-aware preprocessing strips tool-author credit footers
+    (holehe @palenath, BTC donation addresses) and HTTP CSP headers
+    BEFORE regex matching, so we don't extract those as findings.
+
     Returns: number of new findings added.
     """
+    if not output or len(output) < 20:
+        return 0
+
+    # Tool-aware filter — drops noise specific to known tools
+    output = _preprocess_output_for_extraction(output, source_cmd)
     if not output or len(output) < 20:
         return 0
 
@@ -2573,6 +2721,24 @@ def extract_findings_from_stdout(output: str,
 
                 # Quick noise filter
                 if len(val) < 2:
+                    continue
+
+                # ZEUS v1.2: tool-author credit / donation pollution.
+                # Drop anything matching the hardcoded blocklist —
+                # @palenath (holehe author), BTC donation addresses,
+                # tool repo URLs etc. should NEVER become findings
+                # about the subject regardless of where they show up.
+                val_low = val.lower()
+                if val_low in {x.lower() for x in TOOL_CREDIT_NOISE}:
+                    continue
+                # URL pollution: matches like
+                # https://github.com/megadose/holehe should be dropped
+                if any(
+                    noise.lower() in val_low
+                    for noise in TOOL_CREDIT_NOISE
+                    if noise.startswith(("github.com/", "1FHDM",
+                                         "@", "https://"))
+                ):
                     continue
 
                 if ftype == "ip" and val in IP_NOISE:
@@ -2684,7 +2850,7 @@ def auto_cve_lookup(output: str) -> str:
     return "".join(results)
 
 
-# (Removed in v1.1: analyze_and_suggest_exploit — Ares' defensive CVE
+# (Removed in v1.2: analyze_and_suggest_exploit — Ares' defensive CVE
 # triage helper.  Zeus is OSINT-only, doesn't enumerate CVEs from
 # authenticated sources, so this never fired on real Zeus runs.  Call
 # site in run_command was also removed.  See zeus5 commit history.)
@@ -5225,11 +5391,46 @@ class ZeusSession:
         goal = f"OSINT investigation [{lane}]: {seed_label}"
         self.ptt = PTT(goal=goal)
 
+        # ZEUS v1.2: seed PTT subnodes per identifier category so the
+        # strategist has actual nodes to route on, and we can mark
+        # them done as specialists exhaust them.  Without these, the
+        # OTT stays at a single root and nothing gets tracked.
+        # The (category, phase, label_format) mapping:
+        SEED_MAP = [
+            # (intake key, OTT phase, title format)
+            ("handles",   "handle",  "Sweep handle '{}' across platforms"),
+            ("emails",    "email",   "Probe email '{}' for registrations"),
+            ("phones",    "phone",   "Lookup phone '{}' (carrier/line type)"),
+            ("urls",      "social",  "Inspect profile URL {}"),
+            ("images",    "image",   "EXIF metadata from {}"),
+            ("addresses", "crypto",  "Public chain query {}"),
+            ("primary",   "domain",  "Domain footprint {}"),
+            ("domains",   "domain",  "Domain footprint {}"),
+            ("subdomains","subdomain","Subdomain enumeration {}"),
+            ("infra",     "domain",  "Threat-actor infra {}"),
+        ]
+        for key, phase, fmt in SEED_MAP:
+            val = ident.get(key)
+            if not val:
+                continue
+            items = val if isinstance(val, list) else [val]
+            for item in items:
+                if not item:
+                    continue
+                title = fmt.format(item)
+                self.ptt.add_node(
+                    self.ptt.root_id,
+                    title,
+                    phase=phase,
+                    status="todo",
+                )
+
         print()
         print(f"\033[32m   ✓ intake complete — {len(non_empty)} identifier "
-              f"category/ies provided\033[0m")
+              f"category/ies provided "
+              f"({len(self.ptt.nodes) - 1} OTT branches)\033[0m")
         self._log(f"[INTAKE] lane={lane} subject={subject_type} "
-                  f"seeds={non_empty}")
+                  f"seeds={non_empty} ott_branches={len(self.ptt.nodes)-1}")
         return True
 
     # ── OSINT refuse-list gate (universal — runs on every command) ──
@@ -6299,40 +6500,54 @@ class ZeusSession:
                           "with [THOUGHT][CMD][CONF].")
                 continue
 
-            # v7.2 — Track command for repeat detection.  More aggressive
-            # than v7.1: ANY exact repeat in the last 5 commands triggers
-            # a forced agent rotation + RED conf override.  This stops
-            # the loop where dropped kwargs produced identical shells.
+            # v1.2 — Track command for repeat detection.  When the
+            # exact same command surfaces again, the active OTT node
+            # is dead_end'd, the command is added to a session-wide
+            # banned-repeats set, and control is forced back to the
+            # strategist so it picks a NEW node to work on.  Without
+            # this the LLM kept regenerating the same shell every
+            # turn, causing the 16-min sherlock-on-palenath cascade.
             cmd_norm = re.sub(r'\s+', ' ', cmd.strip().lower())
-            if cmd_norm in self.command_history[-5:]:
+            banned_repeats: Set[str] = getattr(self, "_banned_repeats", set())
+            if cmd_norm in self.command_history[-10:] or cmd_norm in banned_repeats:
                 print()
                 print(error_alert(
                     "LOOP DETECTED",
-                    f"You just ran this exact command. Repeating means the "
-                    f"previous result didn't change anything you can act on.",
-                    hint="Forcing pivot to a different approach now."))
+                    f"You just ran this exact command. Marking this branch "
+                    f"as dead_end and routing back to strategist for a new "
+                    f"identifier to investigate.",
+                    hint="Forcing strategist re-route now."))
                 self.stuck_counter += 1
+                # Add to permanent ban so the LLM can't re-issue it
+                banned_repeats.add(cmd_norm)
+                self._banned_repeats = banned_repeats
+                # Mark current node dead_end so the strategist won't
+                # pick it again
                 if active:
-                    self.ptt.increment_attempts(active.nid)
+                    self.ptt.set_status(active.nid, "dead_end")
                     self.ptt.set_confidence(active.nid, "red")
                 if self.stuck_counter >= STUCK_THRESHOLD:
                     self.stuck_counter = 0
                     self._handle_stuck()
                     break
-                # v7.2 — give the LLM stronger guidance: name the command,
-                # require a *different category* of approach, and bump
-                # the agent if possible.
-                rotation_hint = ""
-                if self.current_agent == "strategist":
-                    rotation_hint = " Switch from scanning to direct service interaction (whatweb, curl, nxc, smbclient)."
-                elif self.current_agent == "web":
-                    rotation_hint = " Switch from brute/fuzz to manual probing (curl with payloads) or pivot to network agent."
+                # Force strategist on the next turn so it picks a
+                # different OTT branch (the dead_end one is now off
+                # the queue).
+                self._forced_next_agent = "strategist"
+                pending_todo = [n for n in self.ptt.nodes.values()
+                                if n.status == "todo" and n.nid != self.ptt.root_id]
+                if not pending_todo:
+                    say_warn("All OTT branches exhausted or dead_end'd — "
+                             "ending investigation.")
+                    break
                 prompt = (
-                    f"LOOP-BREAKER: you already ran `{cmd}`. The result "
-                    f"didn't help. Take a FUNDAMENTALLY DIFFERENT approach: "
-                    f"different tool, different angle, different "
-                    f"specialist.{rotation_hint} Output [THOUGHT][CMD][CONF]. "
-                    f"You may [HANDOFF]<other_agent>[/HANDOFF] to escalate."
+                    f"LOOP-BREAKER: command `{cmd[:80]}` was already run. "
+                    f"That branch is dead_end now.  As STRATEGIST, look "
+                    f"at the OTT — there are {len(pending_todo)} pending "
+                    f"todo branches.  Pick ONE and emit a single "
+                    f"[HANDOFF]<role>[/HANDOFF].  Or "
+                    f"[CMD]WORKFLOW_COMPLETE[/CMD] if you've covered "
+                    f"every identifier."
                 )
                 continue
 
@@ -6562,11 +6777,14 @@ class ZeusSession:
     def _llm_cleanup_pass(self) -> str:
         """Ask the AI to write a clean OSINT report from the findings.
         Called at report-generation time.  Returns a markdown body.
-        Falls through to a plain dump if the LLM is unavailable.
+        Falls through to a structured report if the LLM is unavailable.
         """
+        # v1.2: even with zero findings we still render a proper report
+        # so the operator sees coverage gaps + which seeds had no hits.
+        if not self.ptt.findings:
+            return self._fallback_report_body()
+
         verified = self.ptt.get_verified()
-        if not verified and not self.ptt.findings:
-            return "No findings to report."
 
         # Prepare context for the LLM
         v_summary = []
@@ -6659,23 +6877,174 @@ class ZeusSession:
             {"role": "user", "content": user_prompt},
         ], max_tokens=2048)
 
-        if not response:
+        # v1.2: validate response — if Groq was rate-limited, returned
+        # empty, or the response doesn't actually look like a report,
+        # fall through to the structured fallback instead of producing
+        # garbage like "No findings to report."  The structured
+        # fallback is now proper output (grouped, deduped, gap-aware),
+        # so falling back is no longer a "second-best" outcome.
+        if not response or len(response.strip()) < 100:
+            return self._fallback_report_body()
+        # Sanity: the response should mention at least one of our
+        # required section headers; if not, the LLM hallucinated and
+        # we use the structured version instead.
+        required_markers = ("Subject Overview", "Surfaced Identifiers",
+                            "Coverage Gaps", "Confidence")
+        if not any(marker in response for marker in required_markers):
             return self._fallback_report_body()
         return response
 
     def _fallback_report_body(self) -> str:
-        lines = ["## Findings\n"]
-        verified = self.ptt.get_verified()
-        if verified:
-            lines.append("### Verified")
-            for f in verified:
-                lines.append(f"- **{f.ftype}**: `{f.value}` "
-                             f"(source: `{f.source_cmd[:100]}`)")
-        unv = self.ptt.get_unverified()
-        if unv:
-            lines.append("\n### Unverified Candidates")
-            for f in unv:
-                lines.append(f"- **{f.ftype}**: `{f.value}`")
+        """Structured fallback report when the LLM cleanup pass fails.
+
+        v1.2: organised by intake seed.  For each declared identifier
+        (handle / email / phone / etc.) we show what tools were run
+        against it and what hits surfaced.  Findings are deduped by
+        (ftype, lowercase value), CSP/CDN noise is stripped, and
+        sub-findings are limited to a sane top-N per category to keep
+        the report readable.
+        """
+        ti = self.target_info or {}
+        ident = ti.get("identifiers") or {}
+        lane = ti.get("lane") or "(no lane)"
+        seed_label = (
+            ident.get("real_name") or ident.get("legal_name") or
+            ident.get("primary") or
+            (ident.get("addresses") or [None])[0] or
+            (ident.get("handles") or [None])[0] or
+            "(unnamed subject)"
+        )
+
+        # Build de-duplicated, lowercased index of findings
+        seen: Set[Tuple[str, str]] = set()
+        clean_findings: List = []
+        for f in self.ptt.findings:
+            key = (f.ftype, str(f.value).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            clean_findings.append(f)
+
+        # Drop common CDN / infrastructure noise that pollutes any
+        # curl-against-github run — these are universally not findings
+        # about the subject.
+        CDN_NOISE_FRAGMENTS = (
+            "githubusercontent.com", "githubassets.com", "githubcopilot.com",
+            "githubstatus.com", "githubnext.com", "github-cloud",
+            "github-production", "blob.core.windows.net",
+            "amazonaws.com", "tunnels.api.visualstudio.com",
+            "actions.githubusercontent", "githubapp.com",
+            "fastly.net", "cloudflare.com", "akamaihd.net",
+            "gstatic.com", "googleapis.com", "googleusercontent.com",
+            "cdninstagram.com", "fbcdn.net", "twimg.com",
+        )
+        def _is_cdn_noise(val: str) -> bool:
+            v = val.lower()
+            return any(frag in v for frag in CDN_NOISE_FRAGMENTS)
+
+        # Split into "real" vs "infra noise"
+        real_findings = [f for f in clean_findings
+                         if not (f.ftype == "domain" and _is_cdn_noise(f.value))]
+        cdn_count = len(clean_findings) - len(real_findings)
+
+        # Group by ftype
+        by_type: Dict[str, List] = {}
+        for f in real_findings:
+            by_type.setdefault(f.ftype, []).append(f)
+
+        lines: List[str] = []
+
+        # ── Subject Overview ──────────────────────────────────────
+        lines.append("## Subject Overview")
+        lines.append("")
+        lines.append(f"- Subject: **{seed_label}**")
+        lines.append(f"- Lane: `{lane}`")
+        intake_count = sum(
+            len(v) if isinstance(v, list) else (1 if v else 0)
+            for v in ident.values()
+        )
+        lines.append(f"- Intake seeds: {intake_count} value(s) "
+                     f"across {len(self.ptt.nodes)-1} OTT branches")
+        lines.append(f"- Findings surfaced: **{len(real_findings)} real** "
+                     f"(after dropping {cdn_count} CDN/infra noise hits)")
+        lines.append("")
+
+        # ── Coverage by intake seed ───────────────────────────────
+        lines.append("## Coverage by Intake Seed")
+        lines.append("")
+        for nid, node in sorted(self.ptt.nodes.items()):
+            if nid == self.ptt.root_id:
+                continue
+            status_glyph = {"todo": "○", "in_progress": "◐",
+                            "done": "✓", "dead_end": "✗"}.get(node.status, "?")
+            n_findings = len(node.findings)
+            label = f"{status_glyph} `{node.title}`"
+            label += f"  ·  {n_findings} hit(s)" if n_findings else "  ·  no hits"
+            label += f"  ·  status={node.status}"
+            lines.append(f"- {label}")
+        lines.append("")
+
+        # ── Surfaced Identifiers ──────────────────────────────────
+        if by_type:
+            lines.append("## Surfaced Identifiers")
+            lines.append("")
+            # Render in a sensible order
+            ORDER = ["email", "handle", "url", "domain", "phone", "ip",
+                     "exif", "crypto_addr", "hash"]
+            for ftype in ORDER + [t for t in by_type if t not in ORDER]:
+                if ftype not in by_type:
+                    continue
+                items = by_type[ftype]
+                lines.append(f"### {ftype} ({len(items)})")
+                # Cap each category at 30 to keep the report readable;
+                # the operator can re-run for more depth.
+                for f in items[:30]:
+                    mark = "✓" if f.verified else "?"
+                    lines.append(f"- [{mark}] `{f.value}`")
+                if len(items) > 30:
+                    lines.append(f"- _… and {len(items)-30} more {ftype} "
+                                 f"finding(s) (truncated for readability)_")
+                lines.append("")
+        else:
+            lines.append("## Surfaced Identifiers")
+            lines.append("")
+            lines.append("_No real findings beyond CDN/infrastructure noise._")
+            lines.append("")
+
+        # ── Coverage gaps ─────────────────────────────────────────
+        gaps = []
+        if not ident.get("emails"):
+            gaps.append("No emails were provided — Zeus could not run holehe.")
+        if not ident.get("handles"):
+            gaps.append("No handles were provided — Zeus could not run sherlock/maigret.")
+        if not ident.get("phones"):
+            gaps.append("No phone was provided — Zeus could not run phoneinfoga.")
+        if not ident.get("images"):
+            gaps.append("No image paths were provided — Zeus could not run exiftool.")
+        if cdn_count > 20:
+            gaps.append(f"{cdn_count} CDN/infra hits were filtered as noise — "
+                        f"a CSP-header curl probably leaked them.")
+        if gaps:
+            lines.append("## Coverage Gaps")
+            lines.append("")
+            for g in gaps:
+                lines.append(f"- {g}")
+            lines.append("")
+
+        # ── Confidence ────────────────────────────────────────────
+        v_count = sum(1 for f in real_findings if f.verified)
+        u_count = len(real_findings) - v_count
+        lines.append("## Confidence")
+        lines.append("")
+        lines.append(f"- {v_count} verified (multi-source corroborated)")
+        lines.append(f"- {u_count} unverified (single-source leads)")
+        lines.append("")
+        if u_count and not v_count:
+            lines.append("_All findings are leads from a single source.  "
+                         "For corroboration, manually check 2-3 of the most "
+                         "interesting URLs above to confirm the subject is "
+                         "actually behind them._")
+
         return "\n".join(lines)
 
     def _generate_report(self):
@@ -7160,7 +7529,7 @@ def _build_banner() -> str:
         L(f"        {W}███████╗███████╗╚██████╔╝███████║{M}                          ") + f"{M}│{R}",
         L(f"        {W}╚══════╝╚══════╝ ╚═════╝ ╚══════╝{M}                          ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
-        L(f"   {B}{W}AI OSINT AGGREGATOR{R}{M}  ·  {B}{C}v1.1{R}{M}                          ") + f"{M}│{R}",
+        L(f"   {B}{W}AI OSINT AGGREGATOR{R}{M}  ·  {B}{C}v1.2{R}{M}                          ") + f"{M}│{R}",
         L(f"   {G}Bare-metal Kali NetHunter  ·  Operator: The Priest{M}          ") + f"{M}│{R}",
         L(f"   {G}third pillar · Athena finds · Ares defends · Zeus aggregates{M}") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
