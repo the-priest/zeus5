@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║              ZEUS — AI Legal OSINT Aggregator v1.2               ║
+║              ZEUS — AI Legal OSINT Aggregator v2.0               ║
 ║         Bare-metal Kali NetHunter  ·  Operator: The Priest       ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║                                                                  ║
@@ -12,7 +12,7 @@
 ║   from public sources only — read-only OSINT, no auth bypass,    ║
 ║   no stolen credentials, no system mutation.                     ║
 ║                                                                  ║
-║   v1.2 — bug-fix pass on first real run                          ║
+║   v2.0 — bug-fix pass on first real run                          ║
 ║   • Stripped IOC fanout (was leaking Ares defensive log sweeps). ║
 ║   • Strategist now strictly delegates via [HANDOFF];             ║
 ║     specialists actually run their tools.                        ║
@@ -114,7 +114,7 @@ except ImportError:
 # VERSION & PROVIDER CHAIN  (Groq only, biggest→smallest)
 # ═════════════════════════════════════════════════════════════════════
 
-VERSION = "1.2"
+VERSION = "2.0"
 
 # Strict size descending. Compound models last because they have their
 # own internal multi-step behaviour that fights our DTT control flow.
@@ -771,84 +771,52 @@ def kali_tool_summary_for_prompt() -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════
-# FINDING PATTERNS — strict, context-aware
+# FINDING PATTERNS — OSINT only (v2.0)
 #
-# Lessons from v6.1: regex like `(?:password|pass)[:\s=]+(\S+)` matches
-# the AI's own thinking ("...try password: helper...") and pollutes
-# state.  v7.0 only runs these on raw subprocess stdout, never on the
-# model's text.  Patterns are also tightened so noise like "200:not"
-# (which came from "user:200, pass:not" in the AI's prose) can't match.
+# v2.0 strip: removed every Ares/Athena leftover finding type that has
+# nothing to do with OSINT.  Gone: cron_entry (matched MX priorities!),
+# suid, cap_grant, auth_fail, sudo_use, persistence, container,
+# ssh_key, aws_key, suspicious_proc, suricata_alert, av_hit, yara_hit,
+# attack_id, account, hash, port, svc.  These were polluting findings
+# with infrastructure metadata (DNS records → "cron_entry") and giving
+# the AI permission to produce findings about local-system artefacts
+# instead of public OSINT pivots.
+#
+# Patterns are run ONLY on raw subprocess stdout, never on AI text,
+# and ONLY after the per-tool sanitiser has stripped author footers
+# and HTTP-header noise.
 # ═════════════════════════════════════════════════════════════════════
 
 FINDING_PATTERNS = {
-    # IPv4 addresses (still useful — IOC IPs)
+    # IPv4 addresses — useful when the subject is a domain or
+    # threat-actor whose infrastructure resolves to specific IPs.
     "ip":        r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b',
 
-    # Listening ports from ss/netstat: "tcp LISTEN ... :22 ..."
-    "port":      r'(?:LISTEN|0\.0\.0\.0:|\*:|\[::\]:)(\d{1,5})\b',
-
-    # Service+version on listening sockets via ss -tlnp output
-    "svc":       r'users:\(\("([A-Za-z][A-Za-z0-9_\-]{1,40})"',
-
-    # Suspicious user creation / login: "user X" tagged as account hits
-    "account":   r'(?:^|\n|\s)(?:user|account|login|sAMAccountName|uid)[:\s=]+([a-zA-Z][a-zA-Z0-9_\.\-]{2,32})\b',
-
-    # Hash values picked up while reviewing files (could be IOC or local)
-    "hash":      r'(?:^|\n|\s|:|=)([a-fA-F0-9]{32,64})(?:\s|$|:)',
-
-    # CVEs surfaced by audit tools (lynis / wesng / openscap)
-    "cve":       r'\b(CVE-\d{4}-\d{4,7})\b',
-
-    # Domains (broad — IOC enrichment / suspicious DNS)
+    # Domains — primary OSINT pivot type.  TLD whitelist filters
+    # filename-shaped false positives (boot.log etc).
     "domain":    r'\b([a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z]{2,})+)\b',
 
-    # URLs (often IOCs in pcap / log analysis)
+    # URLs — second primary OSINT pivot.  Used by sherlock/maigret.
     "url":       r'(https?://[^\s\'"<>]+)',
 
-    # MITRE ATT&CK technique IDs surfaced by sigma/chainsaw/hayabusa
-    "attack_id": r'\b(T1[0-9]{3}(?:\.\d{3})?)\b',
-
-    # YARA matches: "RuleName matched at /path/to/file"
-    "yara_hit":  r'^([A-Za-z_][A-Za-z0-9_]+)\s+(/\S+)',
-
-    # ClamAV / signature-based AV: "/path/file: Win.Trojan.Foo FOUND"
-    "av_hit":    r'(/[\w\.\-/]+):\s+([A-Za-z][\w\.\-]+)\s+FOUND',
-
-    # Suspicious processes (output of pstree / ps with embedded warnings)
-    "suspicious_proc": r'(?:^|\s)((?:python\d?|bash|sh|perl|nc|ncat|socat)\s+-[ce]\s+["\']?[^"\'\s]{16,})',
-
-    # Suricata fast.log alert format
-    "suricata_alert": r'\[\*\*\]\s+\[(?:\d+:){2}\d+\]\s+(.+?)\s+\[\*\*\]',
-
-    # Cron entries — look for schedules in non-standard files
-    "cron_entry": r'^(?:\*|[0-9]{1,2}|[0-9]{1,2}-[0-9]{1,2}|\*/[0-9]+)\s+\S+\s+\S+\s+\S+\s+\S+\s+(.+)$',
-
-    # SUID files (find -perm -4000 output)
-    "suid":      r'^(/\S+)\s.*-rw[sx]r-[sx]r-[sx]',
-
-    # Capabilities (getcap output: "/path/file = cap_xxx")
-    "cap_grant": r'^(/\S+)\s+=\s+(cap_\w[\w\,\+\=]*)',
-
-    # Failed auth events (sshd / pam)
-    "auth_fail": r'(?:Failed password|authentication failure|Invalid user)\s+(?:for\s+)?(\S+)',
-
-    # Successful sudo escalations (could be benign or IOC)
-    "sudo_use":  r'sudo:\s+(\w+)\s+:\s+TTY=\S+\s+;\s+PWD=(\S+)\s+;\s+USER=(\S+)\s+;\s+COMMAND=',
-
-    # Persistence — systemd unit files in non-standard locations
-    "persistence": r'((?:/etc/systemd/system/|/lib/systemd/system/|/home/\S+/\.config/systemd/user/)[\w\-\.@]+\.(?:service|timer))',
-
-    # Docker container IDs (suspicious or unauthorized)
-    "container": r'\b([a-f0-9]{12,64})\s+\S+\s+(?:/|"\$/|\b(?:bash|sh|/bin)',
-
-    # Email addresses (in logs — could be IOC or compromised user)
+    # Email addresses surfaced by holehe / haveibeenpwned (free side) /
+    # GitHub commit history.  Operational addresses (mailauth-reports@,
+    # postmaster@, abuse@, no-reply@) are filtered out below.
     "email":     r'\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b',
 
-    # SSH private key markers (CRITICAL if found exposed)
-    "ssh_key":   r'(-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----)',
+    # CVEs — surfaced rarely (e.g. in bug-bounty scope files).  Kept
+    # because journalism / due-diligence subjects sometimes have
+    # public vulnerability disclosures linked to their entity.
+    "cve":       r'\b(CVE-\d{4}-\d{4,7})\b',
 
-    # AWS-style keys (DLP / secrets exposure)
-    "aws_key":   r'\b(AKIA[0-9A-Z]{16})\b',
+    # BTC addresses — surface from holehe footer (filtered by credit
+    # blocklist) and from any blockchain lookups.  Real subjects
+    # surface them too if the lane is crypto-address.
+    "btc_addr":  r'\b(bc1[a-z0-9]{25,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b',
+
+    # ETH addresses — surface from blockchain lookups and from any
+    # address registries (ENS reverse lookups etc).
+    "eth_addr":  r'\b(0x[a-fA-F0-9]{40})\b',
 }
 
 # These IPs are noise — don't add them as findings
@@ -859,10 +827,64 @@ IP_NOISE = {
 }
 
 # Domains that are noise (shown in command outputs but not real findings)
+# v2.0: expanded to cover Google/Microsoft/Cloudflare mail and DNS
+# infrastructure that surfaces from MX/SPF/DMARC lookups but tells us
+# nothing about the subject.
 DOMAIN_NOISE = {
-    'localhost', 'example.com', 'google.com', 'cloudflare.com',
-    'localdomain', 'arpa', 'in-addr.arpa',
+    'localhost', 'example.com', 'localdomain', 'arpa', 'in-addr.arpa',
+    # Generic mail provider infra — shows up in MX/SPF lookups but not
+    # a finding about the subject
+    'google.com', 'gmail.com', 'l.google.com', '_spf.google.com',
+    'gmail-smtp-in.l.google.com', 'googlemail.com',
+    'outlook.com', 'hotmail.com', 'live.com', 'office.com',
+    'protonmail.com', 'pm.me', 'proton.me',
+    'yahoo.com', 'yahoodns.net', 'yahoo.co.jp',
+    'icloud.com', 'me.com', 'mac.com',
+    'fastmail.com', 'messagingengine.com',
+    'mail.ru', 'yandex.ru', 'aol.com',
+    # CDN / cloud infrastructure
+    'cloudflare.com', 'cloudflare.net',
+    'amazonaws.com', 'awsdns-hostmaster.amazon.com',
+    'azureedge.net', 'azure.com', 'azurewebsites.net',
+    'fastly.net', 'akamai.net', 'akamaiedge.net',
+    'cdn77.org', 'jsdelivr.net', 'unpkg.com',
+    # GitHub auxiliary infra — when we want github specifically as
+    # a finding (e.g. github.com/user) we keep it, but the auxiliary
+    # CDN/copilot domains are noise.
+    'githubusercontent.com', 'githubassets.com', 'githubcopilot.com',
+    'githubstatus.com', 'githubnext.com', 'githubapp.com',
+    # Schemas
+    'w3.org', 'schemas.microsoft.com', 'schemas.openxmlformats.org',
+    # These get picked from license/credit blocks
+    'mozilla.org', 'opensource.org', 'apache.org',
 }
+
+# Operational / role-based email addresses — surface from DNS lookups,
+# WHOIS records, and HTTP responses but are NEVER findings about the
+# subject.  Match by either the full address or the local-part prefix.
+OPERATIONAL_EMAIL_LOCALPARTS = {
+    "postmaster", "abuse", "noreply", "no-reply", "donotreply",
+    "do-not-reply", "mailer-daemon", "mailerdaemon", "bounces",
+    "bounce", "mailauth-reports", "mailauth", "dmarc-reports",
+    "dmarc", "spf-reports", "spf", "dns-admin", "hostmaster",
+    "webmaster", "admin", "administrator", "root", "support",
+    "help", "info", "contact", "sales", "marketing", "press",
+    "media", "legal", "privacy", "security", "trust",
+    "noc", "soc", "abuse-team", "abuse-team",
+    "registrar", "registrant", "tech", "billing",
+    "whois", "domains", "domain", "dns",
+}
+
+def _is_operational_email(val: str) -> bool:
+    """True if `val` looks like a role / DMARC / abuse / postmaster
+    address — not a finding about the subject."""
+    val = val.lower().strip()
+    if "@" not in val:
+        return False
+    local = val.split("@", 1)[0]
+    # Strip any +tag suffix (e.g. abuse+spam@x.com → abuse)
+    base = local.split("+", 1)[0]
+    return base in OPERATIONAL_EMAIL_LOCALPARTS
 
 # Valid TLD whitelist — used to reject false-positive domain/email
 # matches like `boot.log`, `system@HASH.journal`, `lynis-report.dat`.
@@ -2681,9 +2703,17 @@ def extract_findings_from_stdout(output: str,
                                  active_node_id: str) -> int:
     """Run regex patterns over RAW subprocess stdout only.
 
-    v1.2: tool-aware preprocessing strips tool-author credit footers
+    v2.0: tool-aware preprocessing strips tool-author credit footers
     (holehe @palenath, BTC donation addresses) and HTTP CSP headers
     BEFORE regex matching, so we don't extract those as findings.
+
+    v2.0: DNS infrastructure suppression — when the source command
+    is dig/whois/host/nslookup AND it's targeting a generic mail
+    provider (gmail, outlook, yahoo, etc.), we extract NOTHING.  Those
+    lookups return MX/SPF/DMARC infrastructure that tells us nothing
+    about the human subject.  When the subject is a domain itself,
+    the registrar specialist runs whois on the SUBJECT's domain and
+    those findings are kept.
 
     Returns: number of new findings added.
     """
@@ -2695,6 +2725,33 @@ def extract_findings_from_stdout(output: str,
     if not output or len(output) < 20:
         return 0
 
+    # v2.0 DNS-infrastructure suppression
+    cmd_lower = source_cmd.lower()
+    is_dns_lookup = bool(re.search(
+        r'\b(?:dig|host|nslookup|drill|kdig)\b', cmd_lower
+    ))
+    if is_dns_lookup:
+        # If the dig is against a known mail-provider domain, skip
+        # extraction entirely.  These records (MX hostnames, DMARC
+        # report addresses, SPF includes) are infrastructure noise.
+        MAIL_PROVIDER_DOMAINS_IN_CMD = (
+            "gmail.com", "googlemail.com", "outlook.com", "hotmail.com",
+            "live.com", "office.com", "yahoo.com", "icloud.com",
+            "me.com", "mac.com", "protonmail.com", "proton.me",
+            "fastmail.com", "yahoo.co", "aol.com", "mail.ru",
+            "yandex.ru",
+        )
+        if any(p in cmd_lower for p in MAIL_PROVIDER_DOMAINS_IN_CMD):
+            return 0
+        # For any DNS lookup, also drop SPF/DMARC textual artefacts —
+        # they include report addresses + spf includes that are infra
+        # only.  We only let URLs and CVEs through; domain/email/IP
+        # findings from DNS lookups are too noisy without strong
+        # context.
+        ALLOWED_FROM_DNS = {"url", "cve"}
+    else:
+        ALLOWED_FROM_DNS = None  # no restriction
+
     # Strip ANSI codes — they confuse regex
     clean = re.sub(r'\033\[[0-9;]*m', '', output)
     clean = re.sub(r'\x1b\[[0-9;]*m', '', clean)
@@ -2702,6 +2759,8 @@ def extract_findings_from_stdout(output: str,
     new_count = 0
 
     for ftype, pattern in FINDING_PATTERNS.items():
+        if ALLOWED_FROM_DNS is not None and ftype not in ALLOWED_FROM_DNS:
+            continue
         try:
             matches = re.findall(pattern, clean, re.IGNORECASE | re.MULTILINE)
         except re.error:
@@ -2723,7 +2782,7 @@ def extract_findings_from_stdout(output: str,
                 if len(val) < 2:
                     continue
 
-                # ZEUS v1.2: tool-author credit / donation pollution.
+                # ZEUS v2.0: tool-author credit / donation pollution.
                 # Drop anything matching the hardcoded blocklist —
                 # @palenath (holehe author), BTC donation addresses,
                 # tool repo URLs etc. should NEVER become findings
@@ -2774,6 +2833,12 @@ def extract_findings_from_stdout(output: str,
                     # hex blob ≥ 16 chars (systemd journal pattern).
                     if re.search(r'[a-f0-9]{16,}', val):
                         continue
+                    # v2.0: reject operational / role-based addresses
+                    # (mailauth-reports@google, postmaster@, abuse@,
+                    # no-reply@) — these surface from DNS / WHOIS
+                    # lookups but are never findings about the subject.
+                    if _is_operational_email(val):
+                        continue
 
                 if ftype == "account":
                     # Drop generic placeholders that show up in prose / docs
@@ -2805,18 +2870,9 @@ def extract_findings_from_stdout(output: str,
                         if f_obj.fid == fid:
                             f_obj.attack_id, f_obj.attack_name, f_obj.attack_tactic = tag
 
-    # Detect critical-path writes / exposures separately
-    for path in detect_sensitive_paths(clean):
-        fid_before = ptt._next_finding_id
-        ptt.add_finding(value=path, ftype="persistence",
-                        source_cmd=source_cmd, node_id=active_node_id,
-                        notes="critical path touched")
-        if ptt._next_finding_id > fid_before:
-            new_count += 1
-            tag = attack_id_for_finding("persistence")
-            if tag and ptt.findings:
-                f_obj = ptt.findings[-1]
-                f_obj.attack_id, f_obj.attack_name, f_obj.attack_tactic = tag
+    # v2.0: removed Ares detect_sensitive_paths() call here — it added
+    # "persistence" findings for /etc/shadow / /root/.ssh etc which is
+    # defensive logic, not OSINT.
 
     return new_count
 
@@ -2850,7 +2906,7 @@ def auto_cve_lookup(output: str) -> str:
     return "".join(results)
 
 
-# (Removed in v1.2: analyze_and_suggest_exploit — Ares' defensive CVE
+# (Removed in v2.0: analyze_and_suggest_exploit — Ares' defensive CVE
 # triage helper.  Zeus is OSINT-only, doesn't enumerate CVEs from
 # authenticated sources, so this never fired on real Zeus runs.  Call
 # site in run_command was also removed.  See zeus5 commit history.)
@@ -4901,6 +4957,29 @@ def build_system_prompt(agent_role: str,
         f"home addresses or real-time location.  Never modify the local system.",
         f"Operator: The Priest.  This host: {lhost}",
         "",
+        # v2.0 ANTI-HALLUCINATION DIRECTIVE — critical.  Without this
+        # the AI was reading tool credit footers (holehe's `Twitter:
+        # @palenath`, `BTC: 1FHDM49Qf...`) and inferring that THE
+        # SUBJECT was registered on Twitter as @palenath.  That's a
+        # disaster — the entire investigation chases the tool author.
+        "=== TRUST RULES (HARD) ===",
+        "1. ONLY treat as a finding what appears in the FINDINGS block",
+        "   provided in this prompt.  Never invent a finding from a",
+        "   tool's stdout, footer, banner, or credit line.",
+        "2. Tool output frequently contains the tool author's own social",
+        "   handles, donation addresses, and project URLs.  These are",
+        "   NEVER findings about the subject.  If you see `Twitter:",
+        "   @someone` or `For BTC Donations: 1FHDM...` in stdout — that's",
+        "   the tool author advertising, not data about the subject.",
+        "3. DNS records (MX, SPF, DMARC, NS) for generic mail providers",
+        "   (gmail.com, outlook.com, etc.) are infrastructure metadata,",
+        "   not findings.  Never report `mailauth-reports@google.com` or",
+        "   `_spf.google.com` as belonging to the subject.",
+        "4. CSP / Content-Security-Policy headers list dozens of CDN",
+        "   domains that are NEVER subject findings.",
+        "5. If a tool returns no `[+]` hit lines, the lookup found",
+        "   NOTHING.  Do not invent inferences from the credit footer.",
+        "",
         f"=== ACTIVE AGENT: {spec['icon']} {spec['name']} ===",
         spec["persona"],
         spec["extra_rules"],
@@ -5391,7 +5470,7 @@ class ZeusSession:
         goal = f"OSINT investigation [{lane}]: {seed_label}"
         self.ptt = PTT(goal=goal)
 
-        # ZEUS v1.2: seed PTT subnodes per identifier category so the
+        # ZEUS v2.0: seed PTT subnodes per identifier category so the
         # strategist has actual nodes to route on, and we can mark
         # them done as specialists exhaust them.  Without these, the
         # OTT stays at a single root and nothing gets tracked.
@@ -5849,10 +5928,9 @@ class ZeusSession:
             # YARA hit, suricata alert, persistence artifact, sus IP)
             # lands, queue it so the threat hunter sweeps every other
             # relevant source for the same indicator.
+            # v2.0: only OSINT finding types in fanout queue
             IOC_FANOUT_TYPES = {
-                "hash", "yara_hit", "av_hit", "suricata_alert",
-                "persistence", "suspicious_proc", "ip", "domain", "url",
-                "attack_id",
+                "ip", "domain", "url", "email", "btc_addr", "eth_addr",
             }
             for f in self.ptt.findings[-new_count:]:
                 if (f.ftype in IOC_FANOUT_TYPES and
@@ -5861,9 +5939,20 @@ class ZeusSession:
                     print(f"\033[33m   ↳ IOC queued for fanout: "
                           f"{f.ftype} = {f.value[:40]}\033[0m")
 
+        # v2.0 CRITICAL: sanitize the output for AI history.  The
+        # extraction parser already strips holehe author credits etc
+        # before regex matching, but the AI was still seeing the
+        # *original* raw output via history — and hallucinating
+        # findings from it (e.g. reading "Twitter : @palenath" in
+        # holehe's footer and inferring the email is registered there).
+        # Apply the same per-tool sanitiser before compression.
+        sanitized_for_ai = _preprocess_output_for_extraction(
+            raw_output, cmd
+        ) or raw_output
+
         # Compress for AI context
         compressed = compress_output_for_history(
-            raw_output, is_exploit_result=is_exploit
+            sanitized_for_ai, is_exploit_result=is_exploit
         )
         if (len(raw_output) > 1000 and
             len(compressed) < len(raw_output) * 0.5):
@@ -6027,6 +6116,12 @@ class ZeusSession:
 
         agent_role = self._select_agent(active, free_form=prompt)
         self.current_agent = agent_role
+        # v2.0: track consecutive specialist turns so the agent loop
+        # can force periodic strategist re-routing.
+        if agent_role == "strategist":
+            self._specialist_streak = 0
+        else:
+            self._specialist_streak = getattr(self, "_specialist_streak", 0) + 1
 
         # The NEED loop: build a minimal prompt; if the LLM emits [NEED],
         # rebuild with the requested attachments and call again, up to
@@ -6326,10 +6421,23 @@ class ZeusSession:
         # Track success per node so workflow can't auto-complete a
         # streak of failures (v7.2 fix).
         self._node_success_count: Dict[str, int] = {}
+        # v2.0: track consecutive specialist turns to force periodic
+        # strategist re-routing.  Without this a single specialist
+        # (e.g. postman) can monopolise 9+ turns running variations
+        # of the same lookup against a single seed.
+        self._specialist_streak = 0
+        self._red_streak = 0
+        self._banned_repeats: Set[str] = getattr(
+            self, "_banned_repeats", set()
+        )
 
         # Autonomous-mode caps
         loop_start_ts = time.time()
         turns_taken   = 0
+
+        # Cap how many consecutive turns a non-strategist agent gets
+        # before we force back to strategist for re-routing.
+        MAX_SPECIALIST_STREAK = 4
 
         while True:
             # ── Autonomous caps ───────────────────────────────────
@@ -6343,6 +6451,32 @@ class ZeusSession:
                          f"stopping investigation, generating report.")
                 break
             turns_taken += 1
+
+            # v2.0: if a specialist has run too many consecutive
+            # turns without yielding to the strategist, force a
+            # strategist re-route now.  This prevents postman from
+            # spending 9 turns on one email when there are 3 more
+            # branches waiting.
+            if (self._specialist_streak >= MAX_SPECIALIST_STREAK
+                    and self.current_agent != "strategist"):
+                self._forced_next_agent = "strategist"
+                self._specialist_streak = 0
+                pending = [n for n in self.ptt.nodes.values()
+                           if n.status in ("todo", "in_progress") and
+                           n.nid != self.ptt.root_id]
+                if not pending:
+                    say_warn("All OTT branches exhausted — ending.")
+                    break
+                # Append a re-route hint to the next prompt
+                prompt = (
+                    f"PERIODIC RE-ROUTE: a specialist ran for "
+                    f"{MAX_SPECIALIST_STREAK} turns straight.  As "
+                    f"STRATEGIST, reassess the OTT — there are "
+                    f"{len(pending)} pending branch(es).  Either "
+                    f"continue the same branch by re-handing-off to "
+                    f"the same specialist, or pick a different "
+                    f"identifier and route to a different specialist."
+                )
 
             # v7.2 — turn header is now drawn by turn_box() inside
             # think_turn(); no inline header needed here.
@@ -6500,7 +6634,7 @@ class ZeusSession:
                           "with [THOUGHT][CMD][CONF].")
                 continue
 
-            # v1.2 — Track command for repeat detection.  When the
+            # v2.0 — Track command for repeat detection.  When the
             # exact same command surfaces again, the active OTT node
             # is dead_end'd, the command is added to a session-wide
             # banned-repeats set, and control is forced back to the
@@ -6557,6 +6691,43 @@ class ZeusSession:
 
             # Confidence handling — the pill already shows in think_turn()
             if conf == "red":
+                # v2.0: track consecutive RED counts.  After 2 in a
+                # row from the same agent on the same node, mark the
+                # branch dead_end and force the strategist to pick
+                # something else.  Without this Zeus burns 5+ turns
+                # asking the AI to "gather more context" while it
+                # just re-thinks without progress.
+                red_streak = getattr(self, "_red_streak", 0) + 1
+                self._red_streak = red_streak
+                if red_streak >= 2:
+                    print()
+                    print(_box("RED CONFIDENCE — branch abandoned",
+                               [f"  {red_streak}× RED in a row from "
+                                f"{self.current_agent}.  Marking node "
+                                f"dead_end and routing back to strategist "
+                                f"for a different identifier."],
+                               color="31"))
+                    if active:
+                        self.ptt.set_status(active.nid, "dead_end")
+                        self.ptt.set_confidence(active.nid, "red")
+                    self._red_streak = 0
+                    self._forced_next_agent = "strategist"
+                    pending = [n for n in self.ptt.nodes.values()
+                               if n.status == "todo" and
+                               n.nid != self.ptt.root_id]
+                    if not pending:
+                        say_warn("No remaining branches to investigate "
+                                 "— ending.")
+                        break
+                    prompt = (
+                        f"Branch dead_end after 2 RED commands.  As "
+                        f"STRATEGIST, pick one of the {len(pending)} "
+                        f"remaining todo branch(es) and emit a single "
+                        f"[HANDOFF]<role>[/HANDOFF].  Or "
+                        f"[CMD]WORKFLOW_COMPLETE[/CMD] if you've "
+                        f"covered every identifier."
+                    )
+                    continue
                 print()
                 print(_box("RED CONFIDENCE — execution skipped",
                            ["  Asking AI for recon to gather missing "
@@ -6565,6 +6736,9 @@ class ZeusSession:
                           "gather the missing context, not the attack.  "
                           "[THOUGHT][CMD][CONF].")
                 continue
+            else:
+                # Reset streak when a non-RED command actually runs
+                self._red_streak = 0
 
             # Execute the command (always y/n gated)
             if active:
@@ -6779,7 +6953,7 @@ class ZeusSession:
         Called at report-generation time.  Returns a markdown body.
         Falls through to a structured report if the LLM is unavailable.
         """
-        # v1.2: even with zero findings we still render a proper report
+        # v2.0: even with zero findings we still render a proper report
         # so the operator sees coverage gaps + which seeds had no hits.
         if not self.ptt.findings:
             return self._fallback_report_body()
@@ -6877,7 +7051,7 @@ class ZeusSession:
             {"role": "user", "content": user_prompt},
         ], max_tokens=2048)
 
-        # v1.2: validate response — if Groq was rate-limited, returned
+        # v2.0: validate response — if Groq was rate-limited, returned
         # empty, or the response doesn't actually look like a report,
         # fall through to the structured fallback instead of producing
         # garbage like "No findings to report."  The structured
@@ -6897,7 +7071,7 @@ class ZeusSession:
     def _fallback_report_body(self) -> str:
         """Structured fallback report when the LLM cleanup pass fails.
 
-        v1.2: organised by intake seed.  For each declared identifier
+        v2.0: organised by intake seed.  For each declared identifier
         (handle / email / phone / etc.) we show what tools were run
         against it and what hits surfaced.  Findings are deduped by
         (ftype, lowercase value), CSP/CDN noise is stripped, and
@@ -7050,11 +7224,22 @@ class ZeusSession:
     def _generate_report(self):
         """Print the final OSINT report directly to the terminal.
         Zeus is RAM-only — nothing is saved to disk.  Operator copies
-        whatever they want from the terminal before exit."""
+        whatever they want from the terminal before exit.
+
+        v2.0 redesign:
+        - Sections only render if they have content (no empty
+          "ATT&CK Coverage" boxes when nothing was exercised).
+        - Visual hierarchy via colour blocks + section dividers.
+        - Top-line summary box prints first so a quick glance shows
+          what was found and what was skipped.
+        - Findings are grouped by intake seed (so you can see what
+          *each email/handle/domain* yielded) instead of a flat dump.
+        - Raw findings dump only renders when there are < 80 of them,
+          otherwise it directs the operator to the per-seed grouping.
+        """
         ts = datetime.datetime.now()
         duration = ts - self.session_start
 
-        # Subject summary from intake
         ti = self.target_info or {}
         lane = ti.get("lane") or "(no lane)"
         subj = ti.get("subject_type") or "(no subject)"
@@ -7067,91 +7252,232 @@ class ZeusSession:
             "(unnamed subject)"
         )
 
-        # Get LLM-generated body
-        body = self._llm_cleanup_pass()
-        # OSINT-category section (replaces ATT&CK)
-        category_section = self._build_mitre_section()
+        # Build de-duplicated, lowercased index of findings
+        seen: Set[Tuple[str, str]] = set()
+        clean_findings = []
+        for f in self.ptt.findings:
+            key = (f.ftype, str(f.value).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            clean_findings.append(f)
 
-        # ── Render to terminal ─────────────────────────────────────
+        # CDN/infra noise filter for the report (already filtered in
+        # extraction in v2.0, but historic findings persist)
+        CDN_FRAGMENTS = (
+            "githubusercontent.com", "githubassets.com",
+            "githubcopilot.com", "githubstatus.com", "githubnext.com",
+            "blob.core.windows.net", "amazonaws.com",
+            "cloudflare.com", "cdninstagram.com", "fbcdn.net",
+            "twimg.com", "akamai", "fastly.net",
+        )
+        def _is_noise(f) -> bool:
+            v = f.value.lower()
+            if f.ftype == "domain" and any(c in v for c in CDN_FRAGMENTS):
+                return True
+            return False
+
+        real_findings = [f for f in clean_findings if not _is_noise(f)]
+        noise_count = len(clean_findings) - len(real_findings)
+
+        verified = [f for f in real_findings if f.verified]
+        unverified = [f for f in real_findings if not f.verified]
+
+        # Render
         W = 75
-        bar = "═" * W
         thin = "─" * W
 
+        # ── HEADER BANNER ─────────────────────────────────────────
+        bar = "═" * W
         print()
         print(f"\033[33m╔{bar}╗\033[0m")
-        print(f"\033[33m║\033[0m  \033[1m\033[97m  ZEUS  v{VERSION}  ·  OSINT INVESTIGATION REPORT\033[0m"
-              .ljust(W + 16) + f"\033[33m║\033[0m")
+        title = f"  ZEUS v{VERSION}  ·  OSINT INVESTIGATION REPORT"
+        pad_l = " " * 2
+        pad_r = " " * max(0, W - len(title) - 2)
+        print(f"\033[33m║\033[0m\033[1m\033[97m{pad_l}{title}{pad_r}\033[0m\033[33m║\033[0m")
         print(f"\033[33m╚{bar}╝\033[0m")
         print()
-        print(f"  \033[97mSubject:\033[0m       {seed_label}")
-        print(f"  \033[97mLane:\033[0m          {lane}")
-        print(f"  \033[97mSubject type:\033[0m  {subj}")
-        print(f"  \033[97mCommander:\033[0m     The Priest")
-        print(f"  \033[97mStarted:\033[0m       {self.session_start.isoformat(timespec='seconds')}")
+
+        # ── TOP-LINE SUMMARY ──────────────────────────────────────
+        # Status verdict — colour-coded by what was found
+        if verified:
+            verdict = "\033[42m\033[97m\033[1m  VERIFIED FINDINGS  \033[0m"
+        elif real_findings:
+            verdict = "\033[43m\033[30m\033[1m  LEADS — UNVERIFIED  \033[0m"
+        else:
+            verdict = "\033[41m\033[97m\033[1m  NO FINDINGS  \033[0m"
+
+        print(f"  {verdict}")
+        print()
+        print(f"  \033[97mSubject:\033[0m       \033[36m{seed_label}\033[0m")
+        print(f"  \033[97mLane:\033[0m          {lane}  ·  \033[90m{subj}\033[0m")
         print(f"  \033[97mDuration:\033[0m      {str(duration).split('.')[0]}")
-        print(f"  \033[97mThis host:\033[0m     {self.lhost}")
         print(f"  \033[97mFindings:\033[0m      "
-              f"{len(self.ptt.get_verified())} verified · "
-              f"{len(self.ptt.get_unverified())} unverified")
-        if self.context_mgr.tokens_saved_estimate > 0:
-            print(f"  \033[97mTokens saved:\033[0m  "
-                  f"~{self.context_mgr.tokens_saved_estimate:,}")
+              f"\033[32m{len(verified)} verified\033[0m  ·  "
+              f"\033[33m{len(unverified)} leads\033[0m" +
+              (f"  ·  \033[90m{noise_count} infra noise filtered\033[0m"
+               if noise_count else ""))
         print()
 
-        # Identifier inventory
+        # ── SECTION 1: WHAT WAS PROVIDED ──────────────────────────
         non_empty_ids = {k: v for k, v in ident.items() if v}
         if non_empty_ids:
-            print(f"\033[36m  ─── INTAKE IDENTIFIERS ───\033[0m")
+            print(f"\033[36m  ── INTAKE ── what you told Zeus to investigate\033[0m")
+            print()
             for k, v in non_empty_ids.items():
                 if isinstance(v, list):
                     if not v:
                         continue
-                    print(f"    \033[97m{k}:\033[0m")
-                    for item in v[:10]:
-                        print(f"       • {item}")
+                    items_str = ", ".join(str(x) for x in v[:5])
+                    if len(v) > 5:
+                        items_str += f" (+ {len(v)-5} more)"
+                    print(f"    \033[97m{k:14s}\033[0m {items_str}")
                 else:
-                    print(f"    \033[97m{k}:\033[0m  {v}")
+                    print(f"    \033[97m{k:14s}\033[0m {v}")
             print()
 
-        # LLM-generated body
-        print(f"\033[36m  ─── ANALYSIS ───\033[0m")
-        print()
-        for line in body.splitlines():
-            print(f"  {line}")
-        print()
-
-        # OSINT category coverage
-        print(f"\033[36m  ─── OSINT CATEGORY COVERAGE ───\033[0m")
-        for line in category_section.splitlines():
-            print(f"  {line}")
-        print()
-
-        # OTT final state
-        print(f"\033[36m  ─── OSINT TASK TREE (final) ───\033[0m")
-        for line in self.ptt.to_natural_language(max_chars=4000).splitlines():
-            print(f"  {line}")
-        print()
-
-        # Raw findings with provenance
-        if self.ptt.findings:
-            print(f"\033[36m  ─── RAW FINDINGS ───\033[0m")
-            for fnd in self.ptt.findings:
-                mark = "\033[32m✓\033[0m" if fnd.verified else "\033[90m?\033[0m"
-                tag = (f" \033[36m[{fnd.attack_id} {fnd.attack_name}]\033[0m"
-                       if fnd.attack_id else "")
-                print(f"    {mark} \033[97m{fnd.ftype:<14}\033[0m "
-                      f"\033[33m{fnd.value[:60]}\033[0m{tag}")
-                print(f"        \033[90msource: {fnd.source_cmd[:120]}\033[0m")
+        # ── SECTION 2: COVERAGE PER BRANCH ────────────────────────
+        # Always shown (proves Zeus actually did the work)
+        branches = [n for nid, n in self.ptt.nodes.items()
+                    if nid != self.ptt.root_id]
+        if branches:
+            print(f"\033[36m  ── COVERAGE ── what Zeus checked\033[0m")
+            print()
+            for n in branches:
+                glyphs = {
+                    "todo":        "\033[90m○\033[0m skipped  ",
+                    "in_progress": "\033[33m◐\033[0m partial  ",
+                    "done":        "\033[32m✓\033[0m done     ",
+                    "dead_end":    "\033[31m✗\033[0m dead-end ",
+                }
+                glyph = glyphs.get(n.status, "  ?      ")
+                hits = len(n.findings) if hasattr(n, 'findings') else 0
+                # Find findings actually under this branch
+                branch_finds = [f for f in real_findings
+                                if f.node_id == n.nid]
+                hits = len(branch_finds)
+                hit_str = (f"\033[32m{hits} hit(s)\033[0m" if hits
+                           else "\033[90mno hits\033[0m")
+                title = n.title
+                if len(title) > 50:
+                    title = title[:47] + "..."
+                print(f"    {glyph} {title:50s}  {hit_str}")
             print()
 
-        # Disclaimer
+        # ── SECTION 3: WHAT ZEUS FOUND (only if real findings) ────
+        if real_findings:
+            # Group by ftype for clean rendering
+            by_type: Dict[str, list] = {}
+            for f in real_findings:
+                by_type.setdefault(f.ftype, []).append(f)
+
+            ORDER = ["email", "url", "domain", "ip",
+                     "btc_addr", "eth_addr", "cve"]
+            ICONS = {
+                "email": "📧", "url": "🔗", "domain": "🌐",
+                "ip": "🖥 ", "btc_addr": "₿ ", "eth_addr": "Ξ ",
+                "cve": "⚠ ",
+            }
+
+            print(f"\033[36m  ── FINDINGS ── what Zeus surfaced\033[0m")
+            print()
+            for ftype in ORDER + [t for t in by_type if t not in ORDER]:
+                if ftype not in by_type:
+                    continue
+                items = by_type[ftype]
+                icon = ICONS.get(ftype, "• ")
+                title_line = (f"  \033[1m\033[97m{icon} "
+                              f"{ftype.upper()}\033[0m  "
+                              f"\033[90m({len(items)})\033[0m")
+                print(title_line)
+                # Cap at 25 per category
+                for f in items[:25]:
+                    mark = ("\033[32m✓\033[0m" if f.verified
+                            else "\033[33m·\033[0m")
+                    val = f.value
+                    if len(val) > 60:
+                        val = val[:57] + "..."
+                    print(f"    {mark} \033[37m{val}\033[0m")
+                if len(items) > 25:
+                    print(f"      \033[90m... and {len(items)-25} more "
+                          f"{ftype} (truncated)\033[0m")
+                print()
+        else:
+            # No findings — be honest about it, in plain language
+            print(f"\033[36m  ── FINDINGS ── what Zeus surfaced\033[0m")
+            print()
+            print(f"    \033[33mNo public-source findings for this subject "
+                  f"with the\033[0m")
+            print(f"    \033[33midentifiers provided.\033[0m")
+            print()
+            if noise_count:
+                print(f"    \033[90m({noise_count} CDN / infrastructure hits "
+                      f"were filtered as noise.)\033[0m")
+                print()
+
+        # ── SECTION 4: COVERAGE GAPS ──────────────────────────────
+        gaps = []
+        if subj == "person":
+            if not ident.get("emails"):
+                gaps.append("No emails provided  →  holehe / gravatar / "
+                            "MX lookup couldn't run")
+            if not ident.get("handles"):
+                gaps.append("No handles provided  →  sherlock / maigret "
+                            "couldn't run")
+            if not ident.get("phones"):
+                gaps.append("No phone provided  →  phoneinfoga couldn't run")
+            if not ident.get("images"):
+                gaps.append("No images provided  →  exiftool couldn't run")
+        elif subj == "domain":
+            if not (ident.get("primary") or ident.get("domains")):
+                gaps.append("No primary domain  →  whois / subfinder / "
+                            "crt.sh couldn't run")
+        elif subj == "company":
+            if not ident.get("domains"):
+                gaps.append("No company domain  →  infrastructure pivots "
+                            "couldn't run")
+        elif subj == "crypto-address":
+            if not ident.get("addresses"):
+                gaps.append("No address provided  →  chain query couldn't run")
+        # Dead-end branches
+        dead_branches = [n for n in branches if n.status == "dead_end"]
+        if dead_branches:
+            gaps.append(f"{len(dead_branches)} branch(es) hit dead-end  →  "
+                        f"public source had no info on that identifier")
+        if gaps:
+            print(f"\033[36m  ── COVERAGE GAPS ── what Zeus couldn't check\033[0m")
+            print()
+            for g in gaps:
+                print(f"    \033[90m• {g}\033[0m")
+            print()
+
+        # ── SECTION 5: NEXT STEPS (only if relevant) ──────────────
+        next_steps = []
+        if real_findings and not verified:
+            next_steps.append("Manually open 2-3 of the URLs above to "
+                              "confirm the subject is behind them.")
+        if not real_findings and gaps:
+            next_steps.append("Re-run with additional identifiers (handles, "
+                              "phone, image paths) for broader coverage.")
+        if next_steps:
+            print(f"\033[36m  ── NEXT STEPS ── for the operator\033[0m")
+            print()
+            for s in next_steps:
+                print(f"    \033[97m→\033[0m {s}")
+            print()
+
+        # ── DISCLAIMER FOOTER ─────────────────────────────────────
         print(f"\033[33m  {thin}\033[0m")
-        print(f"\033[33m  All findings above are PUBLIC OSINT only.  Lane: {lane}.\033[0m")
-        print(f"\033[33m  Retained in RAM only — gone the moment Zeus exits.\033[0m")
-        print(f"\033[33m  No data was written to disk.  Copy what you want NOW.\033[0m")
+        print(f"\033[33m  All findings above are PUBLIC OSINT only.  "
+              f"Lane: {lane}.\033[0m")
+        print(f"\033[33m  Retained in RAM only — gone the moment Zeus "
+              f"exits.\033[0m")
+        print(f"\033[33m  No data was written to disk.  Copy what you "
+              f"want NOW.\033[0m")
         print(f"\033[33m  {thin}\033[0m")
         print()
-        print(f"\033[90m  (Generated by Zeus v{VERSION} at {ts.isoformat(timespec='seconds')})\033[0m")
+        print(f"\033[90m  (Generated by Zeus v{VERSION} at "
+              f"{ts.isoformat(timespec='seconds')})\033[0m")
         print()
 
     def _build_mitre_section(self) -> str:
@@ -7529,7 +7855,7 @@ def _build_banner() -> str:
         L(f"        {W}███████╗███████╗╚██████╔╝███████║{M}                          ") + f"{M}│{R}",
         L(f"        {W}╚══════╝╚══════╝ ╚═════╝ ╚══════╝{M}                          ") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
-        L(f"   {B}{W}AI OSINT AGGREGATOR{R}{M}  ·  {B}{C}v1.2{R}{M}                          ") + f"{M}│{R}",
+        L(f"   {B}{W}AI OSINT AGGREGATOR{R}{M}  ·  {B}{C}v2.0{R}{M}                          ") + f"{M}│{R}",
         L(f"   {G}Bare-metal Kali NetHunter  ·  Operator: The Priest{M}          ") + f"{M}│{R}",
         L(f"   {G}third pillar · Athena finds · Ares defends · Zeus aggregates{M}") + f"{M}│{R}",
         L(f"{' '*65}") + f"{M}│{R}",
