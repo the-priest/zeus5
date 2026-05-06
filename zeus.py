@@ -114,7 +114,7 @@ except ImportError:
 # VERSION & PROVIDER CHAIN  (Groq only, biggest→smallest)
 # ═════════════════════════════════════════════════════════════════════
 
-VERSION = "2.0"
+VERSION = "4.9"
 
 # Strict size descending. Compound models last because they have their
 # own internal multi-step behaviour that fights our DTT control flow.
@@ -2278,6 +2278,14 @@ class PTT:
     def set_status(self, nid: str, status: str):
         if nid in self.nodes:
             self.nodes[nid].status = status
+            # v4.2: when a node becomes dead_end, mark all its
+            # descendants dead_end too — pursuing a child of a dead
+            # branch is a waste of turns.
+            if status == "dead_end":
+                for cid in list(self.nodes[nid].children):
+                    cn = self.nodes.get(cid)
+                    if cn and cn.status in ("todo", "in_progress"):
+                        self.set_status(cid, "dead_end")
 
     def set_confidence(self, nid: str, conf: str):
         if nid in self.nodes and conf in ("green", "yellow", "red"):
@@ -2339,16 +2347,35 @@ class PTT:
     def add_finding(self, value: str, ftype: str, source_cmd: str,
                     node_id: str, verified: bool = False,
                     notes: str = "") -> int:
-        # de-dup by (ftype, value)
-        for f in self.findings:
-            if f.ftype == ftype and f.value == value:
-                # Promote verification status if this run verified it
-                if verified and not f.verified:
-                    f.verified = True
-                    f.source_cmd = source_cmd
-                if node_id not in [f.node_id]:
-                    pass  # keep first node that found it
-                return f.fid
+        # v4.4: O(1) dedup via hash index instead of linear scan over
+        # findings.  With many sherlock results the linear scan was
+        # quadratic — for 268 findings that's ~36k comparisons per
+        # add.  This index also handles _normalize collisions.
+        if not hasattr(self, "_finding_index"):
+            self._finding_index: Dict[Tuple[str, str], int] = {}
+            # Rebuild from existing findings if any
+            for f in self.findings:
+                k = (f.ftype, self._normalize_finding_value(f.value, f.ftype))
+                self._finding_index[k] = f.fid
+
+        norm_val = self._normalize_finding_value(value, ftype)
+        idx_key = (ftype, norm_val)
+        existing_fid = self._finding_index.get(idx_key)
+        if existing_fid is not None:
+            # Promote verification status if this run verified it
+            for f in self.findings:
+                if f.fid == existing_fid:
+                    if verified and not f.verified:
+                        f.verified = True
+                        f.source_cmd = source_cmd
+                    return f.fid
+            # Stale index entry — fall through and re-add
+        # v4.5: hard cap on total findings.  After 1500 unique findings
+        # the AI is overwhelmed and the report becomes unreadable.
+        # Drop further additions silently (they're usually low-value
+        # tail noise from runaway specialists).
+        if len(self.findings) >= 1500:
+            return -1
         fid = self._next_finding_id
         self._next_finding_id += 1
         f = Finding(fid=fid, value=value, ftype=ftype,
@@ -2356,9 +2383,40 @@ class PTT:
                     verified=verified, notes=notes,
                     timestamp=datetime.datetime.now().isoformat(timespec="seconds"))
         self.findings.append(f)
+        self._finding_index[idx_key] = fid
         if node_id in self.nodes:
             self.nodes[node_id].findings.append(fid)
         return fid
+
+    @staticmethod
+    def _normalize_finding_value(value: str, ftype: str) -> str:
+        """Normalize a finding value for dedup comparison.  Lowercase
+        all of it, strip `www.` prefix on domain/url, strip trailing
+        slash on URL, strip `https://` vs `http://` distinction.
+
+        v2.7: also collapse dash/underscore variants in URL paths so
+        `medium.com/@the_priest` and `medium.com/@the-priest` dedup."""
+        v = (value or "").strip().lower()
+        if ftype == "url":
+            # Treat https://x/ and http://x as the same finding
+            v = re.sub(r'^https?://', '', v)
+            v = v.rstrip('/')
+            if v.startswith("www."):
+                v = v[4:]
+            # v2.7: replace _ with - in the path so the same handle
+            # shown as `the_priest` and `the-priest` collapses.  Only
+            # touches the path part (after the first /), not the host.
+            if "/" in v:
+                host, _, path = v.partition("/")
+                path = path.replace("_", "-")
+                v = host + "/" + path
+        elif ftype == "domain":
+            if v.startswith("www."):
+                v = v[4:]
+            v = v.rstrip('.')
+            # v2.7: collapse subdomain dash/underscore variants
+            v = v.replace("_", "-")
+        return v
 
     def get_findings_by_type(self, ftype: str,
                              only_verified: bool = False) -> List[Finding]:
@@ -2650,14 +2708,104 @@ def _preprocess_output_for_extraction(output: str, source_cmd: str) -> str:
     # progress bars and totals at the end.  Keep only [+] lines so
     # the totals/timing lines don't pollute (they look like
     # "98 results in 41.2 seconds" etc.).
-    if "sherlock" in cmd_lower:
-        kept = [l for l in output.splitlines() if l.strip().startswith("[+]")]
+    #
+    # v2.1 false-positive filter: sherlock often prints services that
+    # responded HTTP 200 but don't actually expose the user's profile
+    # at the URL.  Two patterns surface from this:
+    #   (a) Bare URLs with no username path: `Discord: https://discord.com`
+    #       — Discord doesn't have URL-addressable user profiles.
+    #   (b) Search query URLs: `OP.GG ...search?q=user&region=tr`
+    #       — that's a search, not a profile.  Same template emitted
+    #       per-region, producing a dozen near-identical findings.
+    # We filter both.
+    #
+    # v2.6: Known-noisy sherlock services.  These services frequently
+    # return HTTP 200 for any username probe (because they don't
+    # actually distinguish between found/not-found at the URL level)
+    # so sherlock prints them even when no profile exists.
+    SHERLOCK_KNOWN_FALSE_POSITIVES = {
+        # Service names (lowercase, partial match in [+] line)
+        "discord", "discord.bio",  # Discord doesn't expose user URLs
+        "nationstates",  # always returns 200 even for bogus regions
+        "yandexmusic",   # geo-blocked, often 200 from non-RU
+        "interpals",     # template page returns 200 for any name
+        "patched.sh",    # generic profile page
+        "nationstates nation", "nationstates region",
+        "code snippet wiki", "codesnippets",
+        "phpru", "php.ru",
+        "svidbook", "opennet", "velomania", "igromania",
+        "shelf",  # known false-positive in sherlock
+        "hudsonrock",  # API endpoint, not profile
+        "rarible",  # API endpoint
+        "discords.com",  # third-party Discord dir, frequent 200
+        "mercadolivre",  # template returns 200
+    }
+    if "sherlock" in cmd_lower or "maigret" in cmd_lower:
+        # v2.9 maigret stub-lines: maigret prints status lines that
+        # also start with [+] but aren't actual findings.  Filter:
+        #   "[+] DB auto-update: database updated successfully"
+        #   "[+] Using sites database: ..."
+        MAIGRET_STUB_PREFIXES = (
+            "db auto-update", "using sites database", "search engines",
+            "logging level", "fetched", "downloaded", "starting search",
+            "checking", "found:", "results:", "loading database",
+            "database loaded", "username", "fields:",
+        )
+        # v3.1: API-endpoint URL patterns sherlock surfaces as
+        # "profile" hits but which are actually backend APIs.
+        API_ENDPOINT_PATH_FRAGMENTS = (
+            "/api/", "/api-v", "/api/v",
+            "cavalier.hudsonrock.com",  # always API URL
+            "rarible.com/marketplace/api",
+            "discords.com/api",
+        )
+        kept = []
+        for line in output.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("[+]"):
+                continue
+            # v2.9: maigret stub-lines (status, not findings)
+            line_lower = stripped.lower()
+            after_marker = line_lower[3:].lstrip()
+            if any(after_marker.startswith(p) for p in MAIGRET_STUB_PREFIXES):
+                continue
+            # v2.6: drop known false-positive services
+            svc_match = re.match(r'\[\+\]\s*([^:]+):\s*', stripped)
+            if svc_match:
+                svc_name = svc_match.group(1).strip().lower()
+                if any(fp in svc_name for fp in SHERLOCK_KNOWN_FALSE_POSITIVES):
+                    continue
+            # Extract the URL part after the colon
+            m = re.search(r'(https?://\S+)', stripped)
+            if not m:
+                kept.append(stripped)
+                continue
+            url = m.group(1)
+            url_lower = url.lower()
+            # v3.1: drop API-endpoint URLs
+            if any(frag in url_lower for frag in API_ENDPOINT_PATH_FRAGMENTS):
+                continue
+            # Filter (a): bare domain with no path or only trivial path
+            from urllib.parse import urlparse
+            try:
+                parsed = urlparse(url)
+                path = parsed.path.strip("/")
+                if not path and not parsed.query:
+                    continue
+            except Exception:
+                pass
+            # Filter (b): search-query URLs
+            if "/search" in url_lower or re.search(r'[?&]q=', url_lower):
+                continue
+            kept.append(stripped)
         return "\n".join(kept)
 
     # ── MAIGRET ───────────────────────────────────────────────────
     # Maigret prints similar [+] lines plus its own credit footer
-    # ("created by soxoj" etc.).
-    if "maigret" in cmd_lower:
+    # ("created by soxoj" etc.).  Handled by the combined sherlock+
+    # maigret branch above in v2.1.
+    # (Empty branch kept here so the cmd-name detection still works.)
+    if False and "maigret" in cmd_lower:
         kept = []
         for line in output.splitlines():
             stripped = line.strip()
@@ -2679,28 +2827,44 @@ TOOL_CREDIT_NOISE = {
     # holehe (megadose)
     "@palenath", "palenath", "megadose", "github.com/megadose/holehe",
     "github.com/megadose", "1FHDM49QfZX6pJmhjLE5tB2K6CaTLMZpXZ",
+    "github.com/megadose/toutatis",
     # sherlock (sdushantha)
     "sdushantha", "github.com/sherlock-project/sherlock",
-    "sherlock-project",
+    "sherlock-project", "github.com/sherlock-project",
     # maigret (soxoj)
-    "soxoj", "github.com/soxoj/maigret",
+    "soxoj", "github.com/soxoj/maigret", "github.com/soxoj",
     # phoneinfoga (sundowndev)
     "sundowndev", "github.com/sundowndev/phoneinfoga",
-    # subfinder (projectdiscovery)
+    "github.com/sundowndev",
+    # subfinder / nuclei / katana (projectdiscovery)
     "projectdiscovery", "github.com/projectdiscovery",
+    "github.com/projectdiscovery/subfinder",
+    "github.com/projectdiscovery/katana",
+    "github.com/projectdiscovery/nuclei",
     # gau (lc)
     "github.com/lc/gau",
-    # waybackurls (tomnomnom)
+    # waybackurls / assetfinder (tomnomnom)
     "tomnomnom", "github.com/tomnomnom",
+    "github.com/tomnomnom/waybackurls",
+    "github.com/tomnomnom/assetfinder",
+    # whatsmyname (webbreacher)
+    "webbreacher", "github.com/webbreacher",
+    # exiftool (Phil Harvey)
+    "exiftool.org",
+    # crt.sh (Sectigo)
+    "crt.sh",
     # general
     "w3.org",  # XHTML doctype URLs are not findings
+    "schemas.microsoft.com",
+    "schemas.openxmlformats.org",
 }
 
 
 def extract_findings_from_stdout(output: str,
                                  source_cmd: str,
                                  ptt: PTT,
-                                 active_node_id: str) -> int:
+                                 active_node_id: str,
+                                 intake_handles: Optional[List[str]] = None) -> int:
     """Run regex patterns over RAW subprocess stdout only.
 
     v2.0: tool-aware preprocessing strips tool-author credit footers
@@ -2783,21 +2947,12 @@ def extract_findings_from_stdout(output: str,
                     continue
 
                 # ZEUS v2.0: tool-author credit / donation pollution.
-                # Drop anything matching the hardcoded blocklist —
-                # @palenath (holehe author), BTC donation addresses,
-                # tool repo URLs etc. should NEVER become findings
-                # about the subject regardless of where they show up.
+                # v3.2: drop anything matching the tool-credit
+                # blocklist.  We check substring containment (lowered)
+                # so URL variants and usernames all get filtered.
                 val_low = val.lower()
-                if val_low in {x.lower() for x in TOOL_CREDIT_NOISE}:
-                    continue
-                # URL pollution: matches like
-                # https://github.com/megadose/holehe should be dropped
-                if any(
-                    noise.lower() in val_low
-                    for noise in TOOL_CREDIT_NOISE
-                    if noise.startswith(("github.com/", "1FHDM",
-                                         "@", "https://"))
-                ):
+                if any(noise.lower() in val_low
+                       for noise in TOOL_CREDIT_NOISE):
                     continue
 
                 if ftype == "ip" and val in IP_NOISE:
@@ -2805,6 +2960,12 @@ def extract_findings_from_stdout(output: str,
 
                 if ftype == "domain":
                     if val.lower() in DOMAIN_NOISE:
+                        continue
+                    # v2.1: also reject after stripping `www.` prefix
+                    val_no_www = val.lower()
+                    if val_no_www.startswith("www."):
+                        val_no_www = val_no_www[4:]
+                    if val_no_www in DOMAIN_NOISE:
                         continue
                     # Filter noise like "etc.local", "1.2.3.4"
                     if re.match(r'^\d+\.\d+\.\d+\.\d+$', val):
@@ -2822,6 +2983,20 @@ def extract_findings_from_stdout(output: str,
                     if any(len(p) >= 16 and re.fullmatch(r'[a-f0-9]+', p)
                            for p in parts[:-1]):
                         continue
+                    # v2.3: subdomain-as-username filter.  Sherlock/
+                    # maigret surface URLs like the-priest.itch.io
+                    # where the leading subdomain IS the subject's
+                    # handle.  Don't double-extract these as new
+                    # domain pivots — the URL finding already
+                    # captures everything useful.  We drop the
+                    # domain finding when its first segment matches
+                    # any intake handle (allowing underscore/dash
+                    # variants).
+                    if intake_handles:
+                        first_seg = parts[0].lower().replace("_", "-")
+                        if any(h.lower().replace("_", "-") == first_seg
+                               for h in intake_handles):
+                            continue
 
                 if ftype == "email":
                     # Email must end in a recognised TLD too —
@@ -2855,11 +3030,29 @@ def extract_findings_from_stdout(output: str,
                     if len(val) not in (32, 40, 56, 64):
                         continue
 
+                # v3.6: sherlock and maigret only emit [+] lines for
+                # URLs that returned a positive HTTP response with the
+                # expected pattern, so URL findings from those tools
+                # are effectively pre-verified.  Mark them verified so
+                # the report shows a green check rather than the
+                # yellow "lead" mark.  We exclude domain findings and
+                # the false-positive services already filtered by the
+                # preprocessor.
+                src_lower = source_cmd.lower()
+                from_username_tool = (
+                    "sherlock" in src_lower or "maigret" in src_lower or
+                    "whatsmyname" in src_lower
+                )
+                pre_verified = (
+                    from_username_tool and ftype == "url"
+                )
+
                 # Add to PTT (auto de-dups)
                 fid_before = ptt._next_finding_id
                 fid = ptt.add_finding(value=val, ftype=ftype,
                                 source_cmd=source_cmd,
-                                node_id=active_node_id)
+                                node_id=active_node_id,
+                                verified=pre_verified)
                 if ptt._next_finding_id > fid_before:
                     new_count += 1
                     # Auto-tag with ATT&CK technique
@@ -2913,9 +3106,15 @@ def auto_cve_lookup(output: str) -> str:
 
 
 def compress_output_for_history(output: str,
-                                is_exploit_result: bool = False) -> str:
+                                is_exploit_result: bool = False,
+                                source_cmd: str = "") -> str:
     """Aggressive compression of terminal output for AI context.
-    Exploit results are kept intact (creds/shells matter)."""
+    Exploit results are kept intact (creds/shells matter).
+
+    v3.7: when the source command is a URL-listing OSINT tool
+    (sherlock, maigret, whatsmyname, gau, waybackurls, subfinder),
+    we keep more of the output and never middle-trim — every line
+    is potentially a separate finding the AI shouldn't lose."""
     if is_exploit_result:
         return output[:MAX_OUTPUT_CHARS]
 
@@ -2946,10 +3145,27 @@ def compress_output_for_history(output: str,
         last = line
 
     result = '\n'.join(cleaned).strip()
-    if len(result) > 1800:
-        head = result[:800]
-        tail = result[-600:]
-        result = f"{head}\n[...{len(result)-1400} chars trimmed...]\n{tail}"
+
+    # v3.7: URL-listing tool — keep up to 6000 chars without
+    # middle-trimming.  Each line is a finding; losing the middle
+    # would silently drop matches the AI needs to see.
+    src_low = source_cmd.lower()
+    is_url_listing = any(t in src_low for t in (
+        "sherlock", "maigret", "whatsmyname", "gau ", "waybackurls",
+        "subfinder", "amass enum", "github_repos_list",
+        "crt.sh", "github.com/users", "/repos?", "phoneinfoga",
+    ))
+    cap = 6000 if is_url_listing else 1800
+    if len(result) > cap:
+        if is_url_listing:
+            # head-only truncation so we keep the FIRST N matches
+            result = result[:cap] + f"\n[...{len(result)-cap} chars trimmed " \
+                                     f"(more URLs follow — re-run with " \
+                                     f"--top-sites if needed)]"
+        else:
+            head = result[:800]
+            tail = result[-600:]
+            result = f"{head}\n[...{len(result)-1400} chars trimmed...]\n{tail}"
     return result or "(no useful output)"
 
 
@@ -4841,6 +5057,31 @@ def build_system_prompt(agent_role: str,
     unverified = ptt.get_unverified()
 
     findings_block = ""
+
+    # v3.5: strategist-specific per-branch summary so it knows what's
+    # been found on each identifier without seeing every URL.
+    if agent_role == "strategist":
+        per_branch = []
+        for nid, n in ptt.nodes.items():
+            if nid == ptt.root_id:
+                continue
+            count = len(n.findings) if hasattr(n, "findings") else 0
+            status_label = {
+                "todo": "todo", "in_progress": "active",
+                "done": "done", "dead_end": "dead-end",
+            }.get(n.status, n.status)
+            per_branch.append(
+                f"  [{nid}] {n.title[:60]}  → status={status_label}, "
+                f"findings={count}, attempts={n.attempts}"
+            )
+        if per_branch:
+            findings_block = ("BRANCH STATE (use this to decide where to "
+                              "route next):\n" + "\n".join(per_branch) +
+                              "\n\nA branch with findings>0 has yielded "
+                              "data — only re-route to it if you want "
+                              "deeper drilling.  Branches with findings=0 "
+                              "and status=todo are the priority.\n\n")
+
     if expand_finds:
         # Full dump — verified + unverified
         if verified or unverified:
@@ -4979,6 +5220,13 @@ def build_system_prompt(agent_role: str,
         "   domains that are NEVER subject findings.",
         "5. If a tool returns no `[+]` hit lines, the lookup found",
         "   NOTHING.  Do not invent inferences from the credit footer.",
+        "6. ACCOUNT FRESHNESS: when an API returns `created_at` /",
+        "   `joined` / `member_since` within ~30 days of today,",
+        "   FLAG IT.  A handle on a brand-new account is suspicious",
+        "   in journalism / due-diligence lanes — could be username",
+        "   squat, impersonation, or a different person who just",
+        "   registered the handle.  Note 'fresh registration: <date>'",
+        "   in your THOUGHT block; do NOT silently treat as confirmed.",
         "",
         f"=== ACTIVE AGENT: {spec['icon']} {spec['name']} ===",
         spec["persona"],
@@ -5447,6 +5695,61 @@ class ZeusSession:
             say_err("No identifiers provided.  Zeus needs at least one seed.")
             return False
 
+        # v3.8: validate intake fields and silently drop malformed
+        # entries with a warning to the operator.  Without this, a
+        # mistyped email like 'lukakraj' goes into the email branch
+        # and holehe fails immediately, wasting a whole branch.
+        EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$')
+        PHONE_RE = re.compile(r'^\+?[0-9\s\-\.\(\)]{7,20}$')
+        URL_RE   = re.compile(r'^https?://[A-Za-z0-9._\-/?&=:%~#]+$', re.I)
+        warnings: List[str] = []
+        if isinstance(ident.get("emails"), list):
+            cleaned = []
+            for e in ident["emails"]:
+                if EMAIL_RE.match(e.strip()):
+                    cleaned.append(e.strip())
+                else:
+                    warnings.append(f"dropped malformed email: {e}")
+            ident["emails"] = cleaned
+        if isinstance(ident.get("phones"), list):
+            cleaned = []
+            for p in ident["phones"]:
+                if PHONE_RE.match(p.strip()):
+                    cleaned.append(p.strip())
+                else:
+                    warnings.append(f"dropped malformed phone: {p}")
+            ident["phones"] = cleaned
+        if isinstance(ident.get("urls"), list):
+            cleaned = []
+            for u in ident["urls"]:
+                u = u.strip()
+                if not u:
+                    continue
+                # Auto-add scheme if missing
+                if not re.match(r'^https?://', u, re.I):
+                    u = "https://" + u
+                if URL_RE.match(u):
+                    cleaned.append(u)
+                else:
+                    warnings.append(f"dropped malformed URL: {u}")
+            ident["urls"] = cleaned
+        # v4.6: validate crypto addresses too
+        if isinstance(ident.get("addresses"), list):
+            BTC_RE = re.compile(r'^(bc1[a-z0-9]{25,90}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$')
+            ETH_RE = re.compile(r'^0x[a-fA-F0-9]{40}$')
+            SOL_RE = re.compile(r'^[1-9A-HJ-NP-Za-km-z]{32,44}$')
+            cleaned = []
+            for a in ident["addresses"]:
+                a = a.strip()
+                if BTC_RE.match(a) or ETH_RE.match(a) or SOL_RE.match(a):
+                    cleaned.append(a)
+                else:
+                    warnings.append(f"dropped malformed crypto address: {a}")
+            ident["addresses"] = cleaned
+        if warnings:
+            for w in warnings:
+                say_warn(f"  intake: {w}")
+
         self.target_info = {
             "lane":         lane,
             "subject_type": subject_type,
@@ -5504,13 +5807,106 @@ class ZeusSession:
                     status="todo",
                 )
 
+        # v3.1 search-with-less-info: when the user provides a real
+        # name + aliases but NO handles, generate likely handle
+        # variants and seed sherlock branches for each.  This way
+        # Zeus actually has something to search with the name alone.
+        # We also do this when handles ARE given but only as a
+        # supplement when the name structure suggests obvious other
+        # candidates (firstlast, first.last, firstl, etc.).
+        existing_handles = set()
+        for h in (ident.get("handles") or []):
+            existing_handles.add(h.lower().strip())
+        for h in (ident.get("aliases") or []):
+            existing_handles.add(h.lower().strip())
+        real_name = (ident.get("real_name") or "").strip()
+        # v4.7: only auto-generate handle variants when the user did
+        # NOT provide a handle.  If they gave one, that's the canonical
+        # handle and we should investigate it deeply rather than spray
+        # 5 guesses.  In journalism / due-diligence lanes, generated
+        # variants are still useful (different alias on different
+        # platforms) — keep them there.
+        already_has_handle = bool(ident.get("handles"))
+        if already_has_handle and lane in ("self-osint", "training"):
+            generated_handles = []
+        else:
+            generated_handles = self._generate_handle_variants(
+                real_name, ident.get("aliases") or [],
+                existing=existing_handles,
+            )
+        for gh in generated_handles[:5]:  # cap at 5 generated
+            self.ptt.add_node(
+                self.ptt.root_id,
+                f"Sweep handle '{gh}' (generated from name)",
+                phase="handle",
+                status="todo",
+            )
+
         print()
         print(f"\033[32m   ✓ intake complete — {len(non_empty)} identifier "
               f"category/ies provided "
               f"({len(self.ptt.nodes) - 1} OTT branches)\033[0m")
+        if generated_handles:
+            print(f"\033[90m     ↳ generated {len(generated_handles[:5])} "
+                  f"handle variants from name: "
+                  f"{', '.join(generated_handles[:5])}\033[0m")
         self._log(f"[INTAKE] lane={lane} subject={subject_type} "
                   f"seeds={non_empty} ott_branches={len(self.ptt.nodes)-1}")
         return True
+
+    @staticmethod
+    def _generate_handle_variants(real_name: str,
+                                  aliases: List[str],
+                                  existing: Set[str]) -> List[str]:
+        """Generate plausible handle variants from a real name.
+        Examples: 'luka krajina' → lukakrajina, luka.krajina, lkrajina,
+        luka_krajina, krajina, lukak.
+
+        v3.1: this addresses the 'search with less info' need.  When a
+        user provides a name but no handle, we still want sherlock to
+        have something to search.
+
+        Returns list of unique candidates not already in `existing`.
+        """
+        out: List[str] = []
+        seen: Set[str] = set(existing)
+
+        sources = [real_name] + [a for a in aliases if a]
+        for src in sources:
+            if not src:
+                continue
+            # Tokenise (split on whitespace, hyphens, underscores)
+            tokens = re.split(r'[\s_\-\.]+', src.lower().strip())
+            tokens = [t for t in tokens if t and t.isalnum()]
+            if not tokens:
+                continue
+            if len(tokens) == 1:
+                # Single name — just the name itself if not present
+                cand = tokens[0]
+                if cand not in seen and len(cand) >= 3:
+                    out.append(cand); seen.add(cand)
+                continue
+            # 2+ tokens (typically firstname lastname)
+            first, last = tokens[0], tokens[-1]
+            if not (first and last and first.isalpha() and last.isalpha()):
+                continue
+            candidates = [
+                first + last,                # lukakrajina
+                first + "." + last,          # luka.krajina
+                first + "_" + last,          # luka_krajina
+                first + "-" + last,          # luka-krajina
+                first[0] + last,             # lkrajina
+                first + last[0],             # lukak
+                last,                        # krajina
+                first,                       # luka
+                last + first,                # krajinaluka (less common)
+                last + first[0],             # krajinal
+            ]
+            for c in candidates:
+                c = c.strip().lower()
+                if 3 <= len(c) <= 30 and c not in seen:
+                    out.append(c); seen.add(c)
+        return out
 
     # ── OSINT refuse-list gate (universal — runs on every command) ──
     def _is_osint_refused(self, cmd: str) -> Tuple[bool, str]:
@@ -5897,9 +6293,20 @@ class ZeusSession:
         active = self.ptt.find_in_progress()
         active_id = active.nid if active else self.ptt.root_id
         findings_before = len(self.ptt.findings)
+        # v2.3: pass intake handles so the extractor can drop
+        # subdomain-as-username findings like the-priest.itch.io
+        intake_handles = []
+        ident = (self.target_info or {}).get("identifiers") or {}
+        for k in ("handles", "aliases"):
+            v = ident.get(k)
+            if isinstance(v, list):
+                intake_handles.extend([h.lower() for h in v if h])
+            elif v:
+                intake_handles.append(str(v).lower())
         new_count = extract_findings_from_stdout(
             raw_output, source_cmd=cmd, ptt=self.ptt,
             active_node_id=active_id,
+            intake_handles=intake_handles,
         )
         if new_count > 0:
             # v7.2 — boxed findings card with the actual extracted values
@@ -5926,18 +6333,11 @@ class ZeusSession:
             self._sync_graph_from_recent_findings(new_count)
             # Defensive fanout: when an IOC (suspicious hash, alert,
             # YARA hit, suricata alert, persistence artifact, sus IP)
-            # lands, queue it so the threat hunter sweeps every other
-            # relevant source for the same indicator.
-            # v2.0: only OSINT finding types in fanout queue
-            IOC_FANOUT_TYPES = {
-                "ip", "domain", "url", "email", "btc_addr", "eth_addr",
-            }
-            for f in self.ptt.findings[-new_count:]:
-                if (f.ftype in IOC_FANOUT_TYPES and
-                    (f.value, f.ftype) not in self.ioc_fanout_queue):
-                    self.ioc_fanout_queue.append((f.value, f.ftype))
-                    print(f"\033[33m   ↳ IOC queued for fanout: "
-                          f"{f.ftype} = {f.value[:40]}\033[0m")
+            # v2.4: IOC fanout system removed entirely.  Was leftover
+            # from Ares (defensive log-sweep) and on Zeus just printed
+            # 268 spam lines per session without doing anything useful.
+            # The flush was already a no-op since v1.1; v2.4 stops the
+            # population side too.
 
         # v2.0 CRITICAL: sanitize the output for AI history.  The
         # extraction parser already strips holehe author credits etc
@@ -5952,7 +6352,8 @@ class ZeusSession:
 
         # Compress for AI context
         compressed = compress_output_for_history(
-            sanitized_for_ai, is_exploit_result=is_exploit
+            sanitized_for_ai, is_exploit_result=is_exploit,
+            source_cmd=cmd,
         )
         if (len(raw_output) > 1000 and
             len(compressed) < len(raw_output) * 0.5):
@@ -6105,6 +6506,23 @@ class ZeusSession:
         Returns dict with: agent, thought, cmd, tool, args, conf,
         verify, handoff, need.
         """
+        # v3.4: enforce single in_progress invariant.  Multiple
+        # handoffs can leave several branches as in_progress
+        # simultaneously; find_in_progress() then returns whichever
+        # the dict iterator hits first (usually the OLDEST), causing
+        # the strategist's intended branch to be ignored.  Pick
+        # exactly one based on most-recently-attempted, demote the
+        # others back to todo so they get reconsidered.
+        in_progs = [n for n in self.ptt.nodes.values()
+                    if n.status == "in_progress" and n.nid != self.ptt.root_id]
+        if len(in_progs) > 1:
+            # Prefer the most-recently-attempted (highest attempts count
+            # as a proxy for activity).  Tie-break: the highest nid.
+            in_progs.sort(key=lambda n: (n.attempts, n.nid))
+            keeper = in_progs[-1]
+            for n in in_progs:
+                if n.nid != keeper.nid:
+                    self.ptt.set_status(n.nid, "todo")
         active = self.ptt.find_in_progress() or self.ptt.find_next_pending()
         if active and active.status == "todo":
             self.ptt.set_status(active.nid, "in_progress")
@@ -6115,6 +6533,13 @@ class ZeusSession:
         self.context_mgr.signal_stuck(self.stuck_counter)
 
         agent_role = self._select_agent(active, free_form=prompt)
+        # v4.8: reset RED streak when the active agent changes.  The
+        # streak is tracked per-agent intent: a different specialist
+        # gets a fresh chance to issue commands without inheriting the
+        # previous specialist's RED streak.
+        prev_agent = getattr(self, "current_agent", None)
+        if prev_agent and prev_agent != agent_role:
+            self._red_streak = 0
         self.current_agent = agent_role
         # v2.0: track consecutive specialist turns so the agent loop
         # can force periodic strategist re-routing.
@@ -6555,29 +6980,51 @@ class ZeusSession:
             else:
                 self._no_cmd_retries = 0  # reset on success
 
-            # Workflow done check — v7.2 GATED on actual progress
-            if WORKFLOW_DONE in cmd.upper() or "WORKFLOW_COMPLETE" in cmd.upper():
-                # v7.2 — refuse to auto-complete a node that has zero
-                # successful commands AND zero findings.  The LLM can
-                # try to bail out of failures with WORKFLOW_COMPLETE;
-                # this gate stops that.
+            # Workflow done check — v2.8 only refuses when there's
+            # something useful left to try.
+            # v3.9: tighten the check so a stray comment containing
+            # "WORKFLOW_COMPLETE" doesn't terminate the loop.  Only
+            # treat it as termination when it's the entire cmd (with
+            # at most a brief comment).
+            cmd_stripped = cmd.strip().upper()
+            is_workflow_done = (
+                cmd_stripped == "WORKFLOW_COMPLETE" or
+                cmd_stripped == WORKFLOW_DONE or
+                cmd_stripped.startswith("WORKFLOW_COMPLETE ") or
+                cmd_stripped.startswith("WORKFLOW_COMPLETE#") or
+                cmd_stripped.startswith("WORKFLOW_COMPLETE//")
+            )
+            if is_workflow_done:
                 node_findings = 0
                 node_successes = 0
                 if active:
                     node_findings = len(active.findings)
                     node_successes = self._node_success_count.get(active.nid, 0)
-                if active and node_findings == 0 and node_successes == 0:
+                # v2.8: don't refuse termination if the agent is
+                # the strategist (they're terminating the whole
+                # investigation, not a specific branch), or if there
+                # are no remaining todo branches.
+                pending_todo = [n for n in self.ptt.nodes.values()
+                                if n.status == "todo" and
+                                n.nid != self.ptt.root_id]
+                refuse = (
+                    self.current_agent != "strategist"
+                    and active and node_findings == 0
+                    and node_successes == 0
+                    and len(pending_todo) > 0  # at least one branch left
+                )
+                if refuse:
                     say_warn(f"Refusing WORKFLOW_COMPLETE on node "
                              f"[{active.nid}] — 0 findings, 0 successful "
-                             f"commands. Try a different approach.")
+                             f"commands. Hand off instead.")
                     prompt = (
                         f"You proposed WORKFLOW_COMPLETE but node "
                         f"[{active.nid}] {active.title} has produced no "
-                        f"successful commands and no findings yet. "
-                        f"You may not skip a node that hasn't yielded "
-                        f"any data. Take a fundamentally different "
-                        f"approach (different tool, different angle), "
-                        f"or [HANDOFF]<other_agent>[/HANDOFF] to escalate."
+                        f"successful commands and no findings yet, and "
+                        f"there are {len(pending_todo)} other branches "
+                        f"to try.  Either issue a different command "
+                        f"on this branch, or [HANDOFF]strategist[/HANDOFF] "
+                        f"to switch branches."
                     )
                     continue
 
@@ -6641,7 +7088,15 @@ class ZeusSession:
             # strategist so it picks a NEW node to work on.  Without
             # this the LLM kept regenerating the same shell every
             # turn, causing the 16-min sherlock-on-palenath cascade.
-            cmd_norm = re.sub(r'\s+', ' ', cmd.strip().lower())
+            # v4.1: scope loop detection per-branch.  If two specialists
+            # legitimately run the same shell command on different
+            # branches (e.g. `holehe` on two different emails), the
+            # global cmd_norm match would falsely trigger.  Now the
+            # loop key is (active_node_id, cmd_norm), so loops only
+            # fire when the SAME branch retries the SAME command.
+            cmd_norm_raw = re.sub(r'\s+', ' ', cmd.strip().lower())
+            active_nid = active.nid if active else "_root_"
+            cmd_norm = f"[{active_nid}]::{cmd_norm_raw}"
             banned_repeats: Set[str] = getattr(self, "_banned_repeats", set())
             if cmd_norm in self.command_history[-10:] or cmd_norm in banned_repeats:
                 print()
@@ -6654,12 +7109,28 @@ class ZeusSession:
                 self.stuck_counter += 1
                 # Add to permanent ban so the LLM can't re-issue it
                 banned_repeats.add(cmd_norm)
+                # v4.3: cap the banned-repeats set size so it doesn't
+                # grow unbounded over long sessions.
+                if len(banned_repeats) > 200:
+                    # Drop oldest 50 (FIFO via list+set roundtrip)
+                    banned_list = list(banned_repeats)
+                    banned_repeats = set(banned_list[-150:])
                 self._banned_repeats = banned_repeats
-                # Mark current node dead_end so the strategist won't
-                # pick it again
+                # v2.5: only dead_end the branch if it has produced
+                # NO findings.  A branch with successful findings
+                # shouldn't be marked dead because of a follow-up
+                # command loop — that destroys legitimate progress
+                # (in v2.4 the handle branch had 266 hits and still
+                # got marked dead-end because of a postman loop later).
                 if active:
-                    self.ptt.set_status(active.nid, "dead_end")
-                    self.ptt.set_confidence(active.nid, "red")
+                    branch_findings = len(active.findings) if hasattr(
+                        active, 'findings') else 0
+                    if branch_findings == 0:
+                        self.ptt.set_status(active.nid, "dead_end")
+                        self.ptt.set_confidence(active.nid, "red")
+                    else:
+                        # Branch has findings — mark done, not dead_end
+                        self.ptt.set_status(active.nid, "done")
                 if self.stuck_counter >= STUCK_THRESHOLD:
                     self.stuck_counter = 0
                     self._handle_stuck()
@@ -6685,9 +7156,9 @@ class ZeusSession:
                 )
                 continue
 
-            self.command_history.append(cmd_norm)
-            if len(self.command_history) > 25:
-                self.command_history = self.command_history[-25:]
+            # v2.2: don't add to command_history yet — RED-skipped
+            # commands shouldn't be flagged as "already run" on retry.
+            # Append happens AFTER successful execution below.
 
             # Confidence handling — the pill already shows in think_turn()
             if conf == "red":
@@ -6708,8 +7179,13 @@ class ZeusSession:
                                 f"for a different identifier."],
                                color="31"))
                     if active:
-                        self.ptt.set_status(active.nid, "dead_end")
-                        self.ptt.set_confidence(active.nid, "red")
+                        # v2.5: don't dead_end a branch with findings
+                        bf = len(active.findings) if hasattr(active, 'findings') else 0
+                        if bf == 0:
+                            self.ptt.set_status(active.nid, "dead_end")
+                            self.ptt.set_confidence(active.nid, "red")
+                        else:
+                            self.ptt.set_status(active.nid, "done")
                     self._red_streak = 0
                     self._forced_next_agent = "strategist"
                     pending = [n for n in self.ptt.nodes.values()
@@ -6732,9 +7208,21 @@ class ZeusSession:
                 print(_box("RED CONFIDENCE — execution skipped",
                            ["  Asking AI for recon to gather missing "
                             "context first."], color="31"))
-                prompt = ("Confidence was RED.  Propose a recon command to "
-                          "gather the missing context, not the attack.  "
-                          "[THOUGHT][CMD][CONF].")
+                # v3.0 anti-hallucination: tell the AI EXPLICITLY
+                # that the command was skipped, didn't execute, and
+                # produced no data.  Without this the next turn's
+                # THOUGHT block treats the dispatch as if it ran
+                # (e.g. "the github_repos_list tool has provided
+                # information about repos" — when it never executed).
+                prompt = (
+                    f"⚠ THE PREVIOUS COMMAND DID NOT EXECUTE.\n"
+                    f"It was tagged RED confidence and skipped.  No "
+                    f"output was produced.  Do NOT reason about the "
+                    f"command as if it ran.  Propose a different "
+                    f"low-risk recon command (GREEN/YELLOW only) that "
+                    f"gathers public-source context.\n"
+                    f"[THOUGHT][CMD][CONF]."
+                )
                 continue
             else:
                 # Reset streak when a non-RED command actually runs
@@ -6745,6 +7233,16 @@ class ZeusSession:
                 self.ptt.increment_attempts(active.nid)
                 self.ptt.set_last_cmd(active.nid, cmd)
             output = self.run_command(cmd)
+
+            # v2.2: only after the command actually executes do we
+            # add to history.  RED-skipped/destructive/interactive-
+            # blocked commands shouldn't fire false LOOP DETECTED on
+            # legitimate retries.
+            if output not in (EXEC_SESSION_EXIT, EXEC_INTERACTIVE_BLOCKED,
+                               EXEC_DESTRUCTIVE, EXEC_REJECTED):
+                self.command_history.append(cmd_norm)
+                if len(self.command_history) > 25:
+                    self.command_history = self.command_history[-25:]
 
             if output == EXEC_SESSION_EXIT:
                 print()
