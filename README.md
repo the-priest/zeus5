@@ -1,244 +1,277 @@
-# Zeus — AI Legal OSINT Aggregator
+# Zeus — Legal OSINT Search Engine
 
-**v1.0** · Bare-metal Kali NetHunter · Operator: The Priest · ⚡ RAM-only
+```
+███████╗███████╗██╗   ██╗███████╗
+╚══███╔╝██╔════╝██║   ██║██╔════╝
+  ███╔╝ █████╗  ██║   ██║███████╗   ⚡
+ ███╔╝  ██╔══╝  ██║   ██║╚════██║
+███████╗███████╗╚██████╔╝███████║
+╚══════╝╚══════╝ ╚═════╝ ╚══════╝
+```
 
-Zeus is the third pillar of the Greek pantheon stack. Where **Athena**
-finds the path in (offense) and **Ares** verifies you've closed it
-(defense), **Zeus** aggregates everything legally findable about a
-subject from public sources — read-only OSINT, no auth bypass, no
-stolen credentials, no system mutation.
+**Fast public-OSINT search.** Give it a name, handle, or email — it
+finds every public profile that actually exists for that person and
+shows you only the ones it can verify by HTTP fetch.
 
-You feed Zeus an extensive intake of identifiers (name, emails,
-phones, handles, URLs, image paths, PGP/SSH fingerprints, anything
-else you have). Zeus runs autonomously — no `y/n/q` prompts during
-the run — and prints a final report to your terminal. **Nothing
-persists.** When you exit, `/tmp/zeus_<pid>/` gets `rm -rf`'d and
-all findings are gone.
+Single file. ~1300 lines. Runs in 60-120 seconds. Designed for
+bare-metal Kali NetHunter (sdm845 / OnePlus 6 / Phosh) but works on
+any Linux with Python 3.10+.
 
----
+Built by **The Priest** as the third pillar of a Greek-pantheon stack:
 
-## What Zeus does
-
-### 11 OSINT specialists
-
-| Icon | Name | What it does |
-|------|------|--------------|
-| ♛ | **Strategist** | Routes the OSINT Task Tree, picks which agent runs next |
-| 🪪 | **Intake** | Lane gate, identifier validation, refuses illegal lanes |
-| 👤 | **Socialite** | Username/handle pivots — sherlock, maigret, whatsmyname, socialscan |
-| 📮 | **Postman** | Email triage — holehe, gravatar, MX/SPF/DMARC, GitHub commit search |
-| 📞 | **Caller** | Phone OSINT — phoneinfoga (carrier/country/line-type only) |
-| 🌐 | **Registrar** | Domain — WHOIS, DNS, subfinder/amass passive, crt.sh, ASN |
-| 🗺 | **Cartographer** | EXIF metadata, GPS coord surfacing (no auto-resolution) |
-| 📚 | **Archivist** | Wayback Machine, archive.org, deleted-content recovery |
-| 🔎 | **Dorker** | Curated Google + GitHub dorks for legitimate self-leak detection |
-| 💰 | **Ledger** | Public blockchain (BTC/ETH/SOL/+) — balance, txs, ENS reverse |
-| 📋 | **Reporter** | Consolidates findings, groups by OSINT category, prints the report |
-
-### 12 workflows
-
-Self-OSINT Footprint · Username Pivot · Email Exposure · Phone Triage
-· Domain Due Diligence · Threat-Actor Handle Tracking · Bug-Bounty
-Recon · Crypto Address Trace · Image Metadata · Wayback History Sweep
-· Company Due Diligence · Document Leakage Hunt
-
-### 46 structured OSINT tool builders
-
-Every tool wraps a free, public-data source. Examples: `sherlock_run`,
-`maigret_run`, `socialscan_run`, `whatsmyname_query`, `holehe_run`,
-`gravatar_lookup`, `github_user_api`, `github_keys_check`,
-`github_email_search`, `github_dork`, `reddit_user_info`,
-`mastodon_lookup`, `bluesky_resolve`, `phoneinfoga_scan`,
-`whois_lookup`, `dig_lookup`, `subfinder_passive`, `amass_passive`,
-`crt_sh_query`, `reverse_ip_hackertarget`, `asn_lookup`,
-`whatweb_passive`, `waybackurls_run`, `gau_run`, `wayback_check`,
-`exiftool_run`, `exiftool_gps_only`, `btc_address_balance`,
-`btc_address_txs`, `eth_address_balance`, `google_dork_curated`.
+| Tool | Role | Repo |
+|------|------|------|
+| Athena | offensive recon agent | [athena5](https://github.com/the-priest/athena5) |
+| Ares | defensive audit agent | [ares5](https://github.com/the-priest/ares5) |
+| **Zeus** | **legal OSINT aggregator** | **(this repo)** |
 
 ---
 
-## Hard refusals
+## What it does
 
-Zeus is **read-only public-data OSINT only.** It refuses:
+```
+intake → enumerate → verify → enrich → report
+```
 
-- **Brute force / credential guessing** — hydra, medusa, hashcat, john, kerbrute, crackmapexec
-- **Stolen credential dumps** — DeHashed credential queries, combolists, weleakinfo, snusbase
-- **Real-time location** — cell-tower triangulation, IMSI catchers, SS7
-- **Home / street address resolution** — explicit and pattern-matched
-- **Stalkerware aggregators** — Spokeo, BeenVerified, TruePeopleSearch, Intelius, Pipl, Whitepages
-- **Voter rolls** — jurisdiction-restricted, mostly stalking
-- **Doxbin and dox sites**
-- **Domestic-abuse-adjacent intent** — ex-partner tracking language patterns
-- **Authenticated scrapers** — instaloader, instagram-scraper, twint
-- **System mutation** — sudo, systemctl, iptables, ufw, fail2ban, kill, etc. (Zeus is OSINT not pentest)
+1. **Intake** — 4 fields: name, handle, email, country. Press
+   Enter to skip any field.
+2. **Enumerate** — runs `sherlock`, `maigret`, `holehe`, and
+   Gravatar in parallel. If you only give a name, Zeus
+   generates 3 likely handle variants (`lukakrajina`,
+   `luka.krajina`, `lkrajina`).
+3. **Verify** — every candidate URL is **fetched live**. Zeus
+   reads the page and checks the handle is actually present in
+   `<title>` or `og:title`. Soft-404 platforms (NationStates,
+   Discord, hudsonrock API, etc.) auto-drop. This is what kills
+   the false-positive flood that sherlock alone produces.
+4. **Enrich** — every confirmed profile gets its bio, display
+   name, location, profile photo, and linked external accounts
+   extracted from meta tags. GitHub gets an extra API call for
+   bio, company, location, blog, repos, followers, created_at.
+5. **Report** — terminal output, grouped by verification status:
+   - `── CONFIRMED PROFILES ──` (verified by HTTP fetch)
+   - `── GITHUB DEEP-DIVE ──` (with freshness flag for new accounts)
+   - `── GRAVATAR ──` (linked accounts pulled from the profile)
+   - `── EMAIL REGISTERED ON ──` (from holehe)
+   - `── UNVERIFIED LEADS ──` (handle in URL but couldn't confirm body)
+   - `── AI SYNTHESIS ──` (optional Groq-written paragraph)
 
-47 refuse patterns hard-coded. There's no override flag. **Zeus refuses by design, not by configuration.**
-
----
-
-## Lane gate
-
-At session start, you pick one of six investigation lanes:
-
-| Lane | Use case |
-|------|----------|
-| `self-osint` | Audit your own digital footprint (most defensible) |
-| `threat-actor` | Track adversary handles + infrastructure (security research) |
-| `journalism` | Public-interest investigation, justification logged in report |
-| `due-diligence` | Entity / company focused, not personal |
-| `bug-bounty` | Authorized program, scope file required |
-| `training` | CTF / known-test-target, no live people |
-
-The lane changes which agents run aggressively and which pivots
-Zeus refuses. Self-OSINT is the strongest lane (you investigating
-yourself); threat-actor avoids real-name attribution; due-diligence
-on a person prompts for a public-interest justification before
-proceeding.
+Everything runs **RAM-only**. Nothing is written to disk. The
+ephemeral workdir `/tmp/zeus_<pid>/` is wiped on exit.
 
 ---
 
-## Install
+## What it deliberately doesn't do
 
-Tested on Kali Linux NetHunter (sdm845, Phosh). Should work on any
-Debian / Ubuntu / Arch system with Python ≥ 3.10.
+- **No authentication bypass.** Public web only.
+- **No credential-dump queries.** Won't query DeHashed for passwords.
+- **No real-time location.** Won't try to pin someone's home.
+- **No stalkerware aggregators.** Won't query Spokeo / BeenVerified.
+- **No system modification.** Read-only.
+- **No disk persistence.** Findings live in RAM and vanish when
+  you exit. Copy what you need before quitting.
+
+If you point it at a person who keeps a private digital footprint
+(locked accounts, single platform, throwaway handles), Zeus will
+honestly tell you it found nothing rather than fabricate results.
+
+---
+
+## Installation
+
+### Quick install (Kali / Ubuntu / Debian)
 
 ```bash
-git clone https://github.com/the-priest/zeus.git
-cd zeus
-chmod +x install.sh
+git clone https://github.com/the-priest/zeus5.git
+cd zeus5
 ./install.sh
 ```
 
-The installer:
-
-1. Detects your login shell, picks the right rc file.
-2. Verifies Python 3.10+.
-3. Installs `groq` and `networkx` (with `--break-system-packages` on PEP 668 systems).
-4. Symlinks `/usr/local/bin/zeus` → `zeus.py` (or falls back to a shell alias if no sudo).
-5. Picks up `GROQ_API_KEY` from your environment if Athena/Ares already set it; otherwise prompts.
-6. Optionally prompts for a `GITHUB_TOKEN` (free PAT, raises GitHub API rate limit 60→5000/hr).
-7. Detects existing `~/.athena` or `~/.ares` and tells you the three are designed to run together.
-
-If the installer can't run, the manual route is:
+### Manual
 
 ```bash
-pip install groq networkx --break-system-packages
-export GROQ_API_KEY='your_key_here'
-python3 zeus.py
+# Python deps
+pip install -r requirements.txt --break-system-packages
+
+# OSINT CLIs (Zeus shells out to these)
+pipx install sherlock-project
+pipx install maigret
+pipx install holehe
+
+# Groq API key (for the optional AI summary)
+export GROQ_API_KEY=gsk_...
+echo 'export GROQ_API_KEY=gsk_...' >> ~/.bashrc
+
+# Symlink for the `zeus` command
+mkdir -p ~/.local/bin
+ln -sf "$PWD/zeus.py" ~/.local/bin/zeus
+chmod +x ~/.local/bin/zeus
 ```
-
-### Optional OSINT CLI tools (graceful degradation)
-
-Zeus runs without these but coverage is reduced:
-
-```bash
-pipx install sherlock-project maigret holehe socialscan
-go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-go install -v github.com/owasp-amass/amass/v4/...@master
-sudo apt install libimage-exiftool-perl jq -y
-```
-
-When a tool is missing, Zeus tells you which one and gives the
-install command in the dispatch error — same pattern as Athena/Ares.
 
 ---
 
 ## Usage
 
 ```bash
-$ zeus
+zeus
 ```
 
-Boot sequence → intake form (lane → subject type → identifiers) →
-autonomous run → terminal report.
+Then answer the 4 intake prompts (any one is enough):
 
-### Intake (full identifier list for a person)
+```
+   Name (real or alias):     Jane Doe
+   Username / handle:        janedoe
+   Email address:            jane@example.com
+   Country (optional):       Ireland
+```
 
-- Real name + aliases
-- Year of birth
-- Email addresses (multi-line)
-- Phone numbers (multi-line)
-- Usernames in `platform:handle` format (e.g. `github:thepriest`)
-- Profile URLs
-- City / state / country (NOT street address — Zeus refuses doxxing)
-- Employer / institution
-- Industry / profession
-- Languages
-- Image file paths (for EXIF extraction)
-- PGP key fingerprint (pivots to public keyservers)
-- SSH key fingerprint OR GitHub username (cross-checks `/USER.keys`)
-- Free-text notes
+Zeus runs the pipeline and prints the report directly to the
+terminal. No flags, no subcommands, no config file.
 
-For **company**, **domain**, **crypto-address**, or **threat-actor**
-subjects, the form adapts.
+### Example output
 
-### Autonomous run
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║  ZEUS v5.1  ·  OSINT SEARCH REPORT                                   ║
+╚══════════════════════════════════════════════════════════════════════╝
 
-Once intake is done, Zeus runs without prompting. Caps:
+    3 CONFIRMED PROFILES
 
-- **50 turns max** per session
-- **15 minutes wall-clock max**
-- Per-tool timeouts (sherlock 5min, holehe 3min, etc.)
+  Subject:    Jane Doe
+  Country:    Ireland
+  Searched:   janedoe, j.doe, jdoe
+  Time:       47s
 
-You can `Ctrl+C` mid-run to stop early — Zeus prints a partial report
-with whatever it found.
+  ── CONFIRMED PROFILES ── verified by HTTP fetch
 
-### Final report
+    ✓  https://github.com/janedoe
+       name:     Jane Doe
+       location: Dublin
+       bio:      Backend engineer.  Rust / Go.
+       links:    https://twitter.com/janedoe, https://janedoe.dev
 
-Printed to terminal in colored sections:
+    ✓  https://www.reddit.com/user/janedoe
 
-- Header (subject, lane, duration, token savings)
-- Intake identifiers (everything you provided)
-- Analysis (LLM-generated summary)
-- OSINT category coverage
-- OSINT Task Tree (final state)
-- Raw findings with provenance (every finding cites its source command)
-- Disclaimer
+    ✓  https://bsky.app/profile/janedoe.bsky.social
 
-**Copy what you want before quitting.** Once you exit, `/tmp/zeus_<pid>/`
-is wiped and everything is gone.
+  ── GITHUB DEEP-DIVE ──
+
+    https://github.com/janedoe
+       name:     Jane Doe
+       bio:      Backend engineer
+       location: Dublin
+       blog:     https://janedoe.dev
+       joined:   2019-03-12 (2615 days ago)
+       repos:    47, followers: 312
+```
 
 ---
 
-## Files (during a session)
+## Configuration
 
-```
-zeus.py                       # the whole agent, single file
-/tmp/zeus_<pid>/              # ephemeral working dir, wiped on exit
-/tmp/zeus_<pid>/logs/         # per-session log (also wiped on exit)
-/tmp/zeus_<pid>.lock          # boot lock, removed on cleanup
-```
+All controlled by constants at the top of `zeus.py`:
 
-**No files survive the session.** No `~/.zeus/`, no persistent reports,
-no saved findings. By design.
+| Constant | Default | What it does |
+|----------|---------|--------------|
+| `TOTAL_TIMEOUT_SEC` | `240` | hard wall-clock cap |
+| `ENUM_TIMEOUT` | `90` | sherlock+maigret+holehe |
+| `PER_FETCH_TIMEOUT` | `7` | one HTTP fetch |
+| `VERIFY_PARALLEL` | `8` | concurrent verifier threads |
+| `ENRICH_PARALLEL` | `4` | concurrent enrich threads |
+
+Edit them in-place if you want longer searches or more aggressive
+parallelism.
 
 ---
 
-## Pairing with Athena and Ares
+## Platform-specific verification
 
-All three tools share the same `GROQ_API_KEY`, the same Kali rig, the
-same UI conventions (boxed turn output, status bar, OSINT/ATT&CK
-tagging). They pair this way:
+Zeus has hardcoded verification rules for high-signal platforms
+where it knows what a real profile page looks like:
 
-| Tool | Persistence | Mode | Mission |
-|------|-------------|------|---------|
-| **Athena** | `~/.athena/` | Manual y/n/q gates | Find the path in (offense) |
-| **Ares** | `~/.ares/` | Manual y/n/q gates | Verify you've closed it (defense) |
-| **Zeus** | NONE (RAM-only) | Autonomous, no gates | Aggregate legal OSINT |
+```
+github · gitlab · bsky · reddit · youtube · medium · twitter / x
+soundcloud · instagram · tiktok · linkedin · facebook · stackoverflow
+lichess · letterboxd · spotify · keybase · tumblr · ...
+```
 
-Athena and Ares are persistent investigation tools you come back to.
-Zeus is a one-shot aggregator — fire it, get a report, exit, gone.
+For everything else it falls back to generic `<title>` / `og:`
+meta tag matching.
+
+Soft-404 platforms (sites that return HTTP 200 for any username,
+making sherlock think every probe is a hit) are hardcoded as
+**auto-noise**. Currently 30+ platforms including: Discord,
+NationStates, hudsonrock API, Rarible, Star Citizen, Russian
+forums (phpRU / svidbook / velomania / igromania / opennet),
+codesnippets fandom, wikidot, interpals, mercadolivre, 1337x,
+couchsurfing, tetr.io.
+
+If you find another platform that's always-200, open an issue or
+add it to `SOFT_404_PLATFORMS` in `zeus.py`.
+
+---
+
+## Why not just use sherlock directly?
+
+Sherlock returns 50-150 "hits" for any common username, most of
+which are false positives (server returned 200 but no real
+profile exists at the URL). Out of the box, sherlock gives you a
+wall of URLs with no way to tell which are real.
+
+Zeus runs sherlock, then fetches each URL and verifies the
+handle is on the page. Typical reduction: 80 sherlock hits →
+5-15 confirmed profiles.
+
+The same principle applies to maigret (which also tries
+underscore/dash variants and frequently doubles up findings).
+
+---
+
+## Tools Zeus shells out to
+
+| Tool | Used for | Required? |
+|------|----------|-----------|
+| `sherlock` | username → candidate URLs | recommended |
+| `maigret` | username → candidate URLs (different DB) | recommended |
+| `holehe` | email → registered services | recommended |
+| `python3` | everything else | yes |
+
+If a tool is missing, Zeus warns at startup and skips that step.
+You still get the others.
+
+---
+
+## API keys
+
+- **Groq** — `GROQ_API_KEY`, free tier. Used **only** for the
+  optional AI summary paragraph at the end of the report.
+  Zeus works fine without it; the AI paragraph is skipped.
+- **GitHub** — `GITHUB_TOKEN`, optional. Without it, the
+  GitHub user API call still works but is rate-limited to 60
+  requests/hour from one IP. With a token: 5000/hour.
+
+No paid APIs. No HIBP (paid since 2024). No Spokeo. No
+BeenVerified. No DeHashed.
+
+---
+
+## Tested on
+
+- Kali Linux Rolling (aarch64) on OnePlus 6, NetHunter,
+  kernel `6.6.58-sdm845-nh`, Phosh UI
+- Linux Mint Cinnamon (x86_64), Dell Latitude E5540
+- ThinkPad X395 dedicated Kali SSD
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for the full text plus a
-use-only-on-systems-and-subjects-you-have-authority-to-investigate
-disclaimer. Personal project by The Priest.
+MIT — see `LICENSE`.
 
-**Use Zeus only on yourself, on people who've consented, on declared
-threat-actor handles, on public companies, on bug-bounty targets in
-declared scope, or on CTF training boxes. The tool refuses the
-illegal cases, but the operator is responsible for staying inside
-their own jurisdiction's law.**
+---
+
+## Acknowledgements
+
+Shells out to `sherlock-project/sherlock`, `soxoj/maigret`,
+`megadose/holehe`. None of those projects endorse this tool.
+The verification + dedup + reporting layer is mine.

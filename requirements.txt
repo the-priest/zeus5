@@ -1,2 +1,6 @@
-groq
-networkx
+# Zeus v5.1 runtime deps — minimal by design.
+# Everything else comes from the Python 3.10+ standard library.
+
+# Optional but recommended: AI summary paragraph at end of report.
+# Comment this line out if you don't have a Groq API key.
+groq>=0.4.0
